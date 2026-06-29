@@ -19,6 +19,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -62,9 +63,68 @@ def session_id(event: dict) -> str:
     return f"hook:{cwd}"
 
 
+def compact(value: object, limit: int = 180) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def preview_for_event(event: dict, name: str) -> str:
+    if name == "UserPromptSubmit":
+        return compact(event.get("prompt"), 180)
+    if name == "PreToolUse":
+        tool_name = compact(event.get("tool_name"), 40)
+        tool_input = compact(event.get("tool_input"), 140)
+        return compact(f"{tool_name}: {tool_input}" if tool_name else tool_input, 180)
+    if name == "PermissionRequest":
+        return compact(event.get("message") or event.get("reason") or event.get("tool_input") or "需要确认", 180)
+    if name in {"Stop", "SubagentStop"}:
+        return compact(event.get("last_assistant_message"), 180)
+    return compact(event, 180)
+
+
+def title_for_event(event: dict, name: str) -> str:
+    prompt = compact(event.get("prompt"), 54)
+    if prompt:
+        return prompt
+    cwd = compact(event.get("cwd") or os.environ.get("PWD"), 160)
+    if cwd:
+        return Path(cwd).name or cwd
+    tool_name = compact(event.get("tool_name"), 54)
+    if tool_name:
+        return tool_name
+    return compact(session_id(event), 54)
+
+
+def metadata_args(event: dict, name: str) -> List[str]:
+    values = {
+        "title": title_for_event(event, name),
+        "cwd": compact(event.get("cwd") or os.environ.get("PWD"), 300),
+        "preview": preview_for_event(event, name),
+        "source-event": name,
+        "tool-name": compact(event.get("tool_name"), 80),
+        "turn-id": compact(event.get("turn_id"), 120),
+        "transcript-path": compact(event.get("transcript_path"), 300),
+        "model": compact(event.get("model"), 80),
+    }
+    args: List[str] = []
+    for key, value in values.items():
+        if value:
+            args.extend([f"--{key}", value])
+    return args
+
+
 def set_light(state: str, event: dict) -> None:
     try:
-        subprocess.run([LIGHT, state, "--session", session_id(event)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        args = [LIGHT, state, "--session", session_id(event), *metadata_args(event, name)]
+        subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         log(f"set {state}")
     except Exception as exc:
         log(f"set-failed {state} {exc}")
@@ -98,12 +158,9 @@ elif name == "PermissionRequest":
     set_light("waiting", event)
 elif name in {"Stop", "SubagentStop"}:
     message = event.get("last_assistant_message") or ""
-    session = session_id(event)
     if looks_waiting(message):
-        subprocess.run([LIGHT, "waiting", "--session", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        log("set waiting")
+        set_light("waiting", event)
     else:
-        subprocess.run([LIGHT, "done", "--session", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        log("set done")
+        set_light("done", event)
 
 print("{}")

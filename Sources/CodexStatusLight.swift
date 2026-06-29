@@ -19,8 +19,8 @@ let designHeight: CGFloat = 384
 var uiScale: CGFloat = readCGFloatPreference("scale") ?? 0.74
 let minUIScale: CGFloat = 0.48
 let maxUIScale: CGFloat = 1.35
-let doneAutoIdleSeconds: TimeInterval = readDoublePreference("done_auto_idle_seconds") ?? 10 * 60
-let sessionStaleSeconds: TimeInterval = readDoublePreference("session_stale_seconds") ?? 6 * 60 * 60
+let defaultDoneAutoIdleSeconds: TimeInterval = 10 * 60
+let defaultSessionStaleSeconds: TimeInterval = 6 * 60 * 60
 let realTrafficLightAssetPrefix = "traffic-light-real"
 
 func currentWindowSize() -> NSSize {
@@ -59,6 +59,31 @@ func blinkFrequency(for light: String) -> CGFloat {
     CGFloat(readDoublePreference(blinkFrequencyKey(for: light)) ?? 1.35)
 }
 
+func effectiveBlinkFrequency(for light: String) -> CGFloat {
+    guard light == "red", readBoolPreference("smart_red_blink") ?? true,
+          let waiting = latestSession(for: "waiting"),
+          !waiting.isAcknowledged else {
+        return blinkFrequency(for: light)
+    }
+    let age = Date().timeIntervalSince1970 - waiting.updatedAt
+    let threshold = readDoublePreference("red_blink_escalate_after_seconds") ?? 30
+    guard age >= threshold else { return blinkFrequency(for: light) }
+    let fastFrequency = readDoublePreference("red_blink_fast_frequency") ?? 2.6
+    return max(blinkFrequency(for: light), CGFloat(fastFrequency))
+}
+
+func doneAutoIdleInterval() -> TimeInterval {
+    max(10, readDoublePreference("done_auto_idle_seconds") ?? defaultDoneAutoIdleSeconds)
+}
+
+func sessionStaleInterval() -> TimeInterval {
+    max(60, readDoublePreference("session_stale_seconds") ?? defaultSessionStaleSeconds)
+}
+
+func clickAcknowledgesSessions() -> Bool {
+    readBoolPreference("click_acknowledges_sessions") ?? true
+}
+
 func stateName(for light: String) -> String {
     switch light {
     case "red": return "waiting"
@@ -75,6 +100,70 @@ func displayName(for light: String) -> String {
     case "green": return "绿灯"
     default: return light
     }
+}
+
+struct StatusSession {
+    let id: String
+    let state: String
+    let updatedAt: TimeInterval
+    let acknowledgedAt: TimeInterval
+    let title: String?
+    let cwd: String?
+    let preview: String?
+    let sourceEvent: String?
+    let toolName: String?
+    let model: String?
+
+    var isAcknowledged: Bool {
+        acknowledgedAt >= updatedAt
+    }
+
+    var displayTitle: String {
+        for value in [title, cwd?.components(separatedBy: "/").last, preview] {
+            if let text = value?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                return clipped(text, limit: 42)
+            }
+        }
+        return shortSessionID(id)
+    }
+
+    var detailTitle: String {
+        let age = relativeAge(from: updatedAt)
+        let ack = isAcknowledged ? "已看" : "未看"
+        if let cwd, !cwd.isEmpty {
+            return "\(age) · \(ack) · \(clipped(cwd, limit: 54))"
+        }
+        if let sourceEvent, !sourceEvent.isEmpty {
+            return "\(age) · \(ack) · \(sourceEvent)"
+        }
+        return "\(age) · \(ack)"
+    }
+
+    var menuTitle: String {
+        "\(displayTitle)  \(detailTitle)"
+    }
+}
+
+func clipped(_ text: String, limit: Int) -> String {
+    guard text.count > limit else { return text }
+    let end = text.index(text.startIndex, offsetBy: max(1, limit - 1))
+    return String(text[..<end]) + "…"
+}
+
+func shortSessionID(_ id: String) -> String {
+    guard id.count > 8 else { return id }
+    return String(id.prefix(8))
+}
+
+func relativeAge(from timestamp: TimeInterval) -> String {
+    let age = max(0, Date().timeIntervalSince1970 - timestamp)
+    if age < 60 {
+        return "\(Int(age))秒前"
+    }
+    if age < 60 * 60 {
+        return "\(Int(age / 60))分钟前"
+    }
+    return "\(Int(age / 3600))小时前"
 }
 
 final class SoundController {
@@ -188,6 +277,9 @@ final class TrafficLightView: NSView {
     var resizeStartMouse = NSPoint.zero
     var resizeStartFrame = NSRect.zero
     var resizeStartScale: CGFloat = uiScale
+    var openFeedbackLight: String?
+    var openFeedbackUntil = Date.distantPast
+    var openFeedbackTitle: String?
     var onStateCommand: ((String) -> Void)?
     weak var ownerWindow: NSWindow?
 
@@ -213,6 +305,7 @@ final class TrafficLightView: NSView {
             drawLamp(center: NSPoint(x: 81, y: 78), light: "green", intensity: intensity(for: "green"))
         }
 
+        drawOpenFeedback()
         NSGraphicsContext.restoreGraphicsState()
 
         if isHoveringResizeHandle || isResizing {
@@ -237,7 +330,7 @@ final class TrafficLightView: NSView {
     func intensity(for light: String) -> CGFloat {
         guard activeLight() == light else { return state == "idle" ? 0.04 : 0.10 }
         if shouldBlink(for: light) {
-            let cycle = fmod(animationPhase * blinkFrequency(for: light), 1)
+            let cycle = fmod(animationPhase * effectiveBlinkFrequency(for: light), 1)
             if cycle < 0.5 {
                 return 0.16 + 0.84 * easeOut(cycle / 0.5)
             }
@@ -297,6 +390,42 @@ final class TrafficLightView: NSView {
     func shouldBlink(for light: String) -> Bool {
         guard isBlinkEnabled(for: light) else { return false }
         return !latestSessionIsAcknowledged(for: stateName(for: light))
+    }
+
+    func hasOpenFeedback() -> Bool {
+        openFeedbackLight != nil && Date() < openFeedbackUntil
+    }
+
+    func showOpenFeedback(light: String, session: StatusSession) {
+        openFeedbackLight = light
+        openFeedbackTitle = session.displayTitle
+        openFeedbackUntil = Date().addingTimeInterval(0.7)
+        toolTip = "已打开：\(session.displayTitle)"
+        needsDisplay = true
+    }
+
+    func drawOpenFeedback() {
+        guard hasOpenFeedback(), let light = openFeedbackLight else { return }
+        let imageRect = NSRect(x: 12, y: 5, width: 138, height: 378)
+        let rect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -5, dy: -5)
+        let progress = CGFloat(max(0, min(1, openFeedbackUntil.timeIntervalSinceNow / 0.7)))
+        let alpha = 0.18 + 0.36 * progress
+
+        NSColor.white.withAlphaComponent(alpha).setStroke()
+        let ring = NSBezierPath(ovalIn: rect.insetBy(dx: -2 + 5 * (1 - progress), dy: -2 + 5 * (1 - progress)))
+        ring.lineWidth = 2.2
+        ring.stroke()
+
+        let check = NSBezierPath()
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        check.move(to: NSPoint(x: center.x - 13, y: center.y - 1))
+        check.line(to: NSPoint(x: center.x - 4, y: center.y - 10))
+        check.line(to: NSPoint(x: center.x + 15, y: center.y + 12))
+        check.lineCapStyle = .round
+        check.lineJoinStyle = .round
+        check.lineWidth = 3.0
+        NSColor.white.withAlphaComponent(alpha).setStroke()
+        check.stroke()
     }
 
     func photoLampRect(for light: String, imageRect: NSRect) -> NSRect {
@@ -813,6 +942,10 @@ final class TrafficLightView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        if let light = lampAtEvent(event) {
+            showLampSessionMenu(with: event, light: light)
+            return
+        }
         showStatusMenu(with: event)
     }
 
@@ -833,28 +966,118 @@ final class TrafficLightView: NSView {
         menu.addItem(.separator())
         addBlinkSettingsMenu(to: menu)
         menu.addItem(.separator())
+        menu.addItem(withTitle: "设置...", action: #selector(AppDelegate.showSettings), keyEquivalent: ",")
+        menu.addItem(.separator())
         menu.addItem(withTitle: isMuted ? "取消静音" : "静音", action: #selector(AppDelegate.toggleMuteFromMenu), keyEquivalent: "")
         menu.addItem(withTitle: "退出", action: #selector(AppDelegate.quit), keyEquivalent: "")
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     func openClickedLampSession(with event: NSEvent) -> Bool {
+        guard let light = lampAtEvent(event) else { return false }
+        let targetState = stateName(for: light)
+        guard let session = latestSession(for: targetState) else {
+            NSSound.beep()
+            return true
+        }
+        if clickAcknowledgesSessions() {
+            acknowledgeSession(session.id)
+        }
+        showOpenFeedback(light: light, session: session)
+        openCodexSession(session.id)
+        return true
+    }
+
+    func lampAtEvent(_ event: NSEvent) -> String? {
         let point = convert(event.locationInWindow, from: nil)
         let designPoint = designPoint(from: point)
         let imageRect = NSRect(x: 12, y: 5, width: 138, height: 378)
         for light in ["red", "yellow", "green"] {
             let hitRect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -12, dy: -12)
-            guard hitRect.contains(designPoint) else { continue }
-            guard let sessionID = latestSessionID(for: stateName(for: light)) else {
-                NSSound.beep()
-                return true
+            if hitRect.contains(designPoint) {
+                return light
             }
-            acknowledgeSession(sessionID)
-            needsDisplay = true
-            openCodexSession(sessionID)
-            return true
         }
-        return false
+        return nil
+    }
+
+    func showLampSessionMenu(with event: NSEvent, light: String) {
+        let targetState = stateName(for: light)
+        let sessions = activeSessions(for: targetState)
+        let menu = NSMenu()
+        let header = NSMenuItem(title: "\(displayName(for: light))：\(sessions.count) 个会话", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        if sessions.isEmpty {
+            let empty = NSMenuItem(title: "没有对应会话", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        } else {
+            let latest = sessions[0]
+            addSessionMenuItem(to: menu, title: "打开最新：\(latest.displayTitle)", session: latest, light: light)
+            let acknowledgeAll = NSMenuItem(title: "全部标记已查看", action: #selector(acknowledgeSessionsFromMenu(_:)), keyEquivalent: "")
+            acknowledgeAll.target = self
+            acknowledgeAll.representedObject = targetState
+            menu.addItem(acknowledgeAll)
+            menu.addItem(.separator())
+            for session in sessions.prefix(10) {
+                addSessionMenuItem(to: menu, title: session.menuTitle, session: session, light: light)
+            }
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "闪烁设置", action: nil, keyEquivalent: "").submenu = blinkOnlyMenu(for: light)
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    func addSessionMenuItem(to menu: NSMenu, title: String, session: StatusSession, light: String) {
+        let item = NSMenuItem(title: title, action: #selector(openSessionFromMenu(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = "\(light)|\(session.id)"
+        if let preview = session.preview, !preview.isEmpty {
+            item.toolTip = preview
+        }
+        item.state = session.isAcknowledged ? .off : .on
+        menu.addItem(item)
+    }
+
+    func blinkOnlyMenu(for light: String) -> NSMenu {
+        let menu = NSMenu(title: "闪烁设置")
+        switch light {
+        case "red":
+            addBlinkItems(for: light, toggle: #selector(AppDelegate.toggleRedBlink), slow: #selector(AppDelegate.setRedBlinkSlow), medium: #selector(AppDelegate.setRedBlinkMedium), fast: #selector(AppDelegate.setRedBlinkFast), to: menu)
+        case "yellow":
+            addBlinkItems(for: light, toggle: #selector(AppDelegate.toggleYellowBlink), slow: #selector(AppDelegate.setYellowBlinkSlow), medium: #selector(AppDelegate.setYellowBlinkMedium), fast: #selector(AppDelegate.setYellowBlinkFast), to: menu)
+        case "green":
+            addBlinkItems(for: light, toggle: #selector(AppDelegate.toggleGreenBlink), slow: #selector(AppDelegate.setGreenBlinkSlow), medium: #selector(AppDelegate.setGreenBlinkMedium), fast: #selector(AppDelegate.setGreenBlinkFast), to: menu)
+        default:
+            break
+        }
+        return menu
+    }
+
+    @objc func openSessionFromMenu(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? String,
+              let separator = payload.firstIndex(of: "|") else {
+            return
+        }
+        let light = String(payload[..<separator])
+        let id = String(payload[payload.index(after: separator)...])
+        if clickAcknowledgesSessions() {
+            acknowledgeSession(id)
+        }
+        if let session = sessionByID(id) {
+            showOpenFeedback(light: light, session: session)
+        }
+        openCodexSession(id)
+    }
+
+    @objc func acknowledgeSessionsFromMenu(_ sender: NSMenuItem) {
+        guard let targetState = sender.representedObject as? String else { return }
+        for session in activeSessions(for: targetState) {
+            acknowledgeSession(session.id)
+        }
+        needsDisplay = true
     }
 
     func addBlinkSettingsMenu(to menu: NSMenu) {
@@ -910,6 +1133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastModified = Date.distantPast
     var waitingBlinkStopTimer: Timer?
     var doneAutoIdleTimer: Timer?
+    var settingsWindowController: SettingsWindowController?
     let soundController = SoundController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -988,6 +1212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch command {
         case "show", "reset-position":
             bringWindowBack()
+        case "settings":
+            bringWindowBack()
+            showSettings()
         case "clear-sessions":
             applyState(readState(), playPrompt: false, writeFile: false)
         default:
@@ -998,11 +1225,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func animateLights() {
         let active = view.activeLight()
+        var shouldRedraw = false
         if !active.isEmpty, view.shouldBlink(for: active) {
             view.animationPhase += 1.0 / 30.0
             if view.animationPhase > 3600 {
                 view.animationPhase = 0
             }
+            shouldRedraw = true
+        }
+        if view.hasOpenFeedback() {
+            shouldRedraw = true
+        } else if view.openFeedbackLight != nil {
+            view.openFeedbackLight = nil
+            shouldRedraw = true
+        }
+        if shouldRedraw {
             view.needsDisplay = true
         }
     }
@@ -1027,6 +1264,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func setGreenBlinkSlow() { setBlinkFrequency(for: "green", frequency: 0.85) }
     @objc func setGreenBlinkMedium() { setBlinkFrequency(for: "green", frequency: 1.35) }
     @objc func setGreenBlinkFast() { setBlinkFrequency(for: "green", frequency: 2.05) }
+    @objc func showSettings() {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController(appDelegate: self)
+        }
+        settingsWindowController?.refresh()
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
     @objc func quit() {
         soundController.stopAll()
         writeState("quit")
@@ -1106,7 +1352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startDoneAutoIdleTimer() {
         doneAutoIdleTimer?.invalidate()
-        doneAutoIdleTimer = Timer.scheduledTimer(withTimeInterval: doneAutoIdleSeconds, repeats: false) { [weak self] _ in
+        doneAutoIdleTimer = Timer.scheduledTimer(withTimeInterval: doneAutoIdleInterval(), repeats: false) { [weak self] _ in
             guard let self, self.view.state == "done" else { return }
             self.applyState("idle", playPrompt: false, writeFile: true)
         }
@@ -1125,6 +1371,167 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !nextMuted {
             soundController.apply(state: view.state, playPrompt: false)
         }
+    }
+}
+
+final class SettingsWindowController: NSWindowController {
+    weak var appDelegate: AppDelegate?
+    let scaleSlider = NSSlider(value: Double(uiScale), minValue: Double(minUIScale), maxValue: Double(maxUIScale), target: nil, action: nil)
+    let scaleValueLabel = NSTextField(labelWithString: "")
+    let clickAckButton = NSButton(checkboxWithTitle: "点击会话后停止闪烁", target: nil, action: nil)
+    let smartRedButton = NSButton(checkboxWithTitle: "红灯未处理自动加快", target: nil, action: nil)
+    let muteButton = NSButton(checkboxWithTitle: "静音", target: nil, action: nil)
+    let doneMinutesField = NSTextField(string: "")
+    let staleHoursField = NSTextField(string: "")
+    let redEscalateField = NSTextField(string: "")
+
+    init(appDelegate: AppDelegate) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 390, height: 330),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Codex 状态灯设置"
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        self.appDelegate = appDelegate
+        buildContent()
+        refresh()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func buildContent() {
+        guard let contentView = window?.contentView else { return }
+        let width: CGFloat = 390
+        let left: CGFloat = 24
+        let fieldX: CGFloat = 236
+        var y: CGFloat = 282
+
+        addLabel("大小", x: left, y: y, width: 80, to: contentView)
+        scaleSlider.frame = NSRect(x: 86, y: y - 4, width: 190, height: 24)
+        scaleSlider.target = self
+        scaleSlider.action = #selector(scaleChanged(_:))
+        contentView.addSubview(scaleSlider)
+        scaleValueLabel.frame = NSRect(x: 286, y: y, width: 64, height: 20)
+        contentView.addSubview(scaleValueLabel)
+
+        y -= 42
+        configureCheckbox(clickAckButton, y: y, in: contentView, action: #selector(clickAckChanged(_:)))
+        y -= 30
+        configureCheckbox(smartRedButton, y: y, in: contentView, action: #selector(smartRedChanged(_:)))
+        y -= 30
+        configureCheckbox(muteButton, y: y, in: contentView, action: #selector(muteChanged(_:)))
+
+        y -= 42
+        addLabel("红灯加快阈值（秒）", x: left, y: y, width: 180, to: contentView)
+        configureField(redEscalateField, x: fieldX, y: y, in: contentView)
+        y -= 34
+        addLabel("绿灯自动变暗（分钟）", x: left, y: y, width: 190, to: contentView)
+        configureField(doneMinutesField, x: fieldX, y: y, in: contentView)
+        y -= 34
+        addLabel("会话过期（小时）", x: left, y: y, width: 180, to: contentView)
+        configureField(staleHoursField, x: fieldX, y: y, in: contentView)
+
+        let applyButton = NSButton(title: "应用", target: self, action: #selector(applyNumberSettings))
+        applyButton.frame = NSRect(x: width - 102, y: 74, width: 78, height: 30)
+        contentView.addSubview(applyButton)
+
+        let resetButton = NSButton(title: "找回浮窗", target: self, action: #selector(resetPosition))
+        resetButton.frame = NSRect(x: left, y: 28, width: 96, height: 30)
+        contentView.addSubview(resetButton)
+
+        let clearButton = NSButton(title: "清空会话", target: self, action: #selector(clearSessions))
+        clearButton.frame = NSRect(x: left + 112, y: 28, width: 96, height: 30)
+        contentView.addSubview(clearButton)
+
+        let closeButton = NSButton(title: "关闭", target: self, action: #selector(closeSettings))
+        closeButton.frame = NSRect(x: width - 102, y: 28, width: 78, height: 30)
+        contentView.addSubview(closeButton)
+    }
+
+    func addLabel(_ title: String, x: CGFloat, y: CGFloat, width: CGFloat, to view: NSView) {
+        let label = NSTextField(labelWithString: title)
+        label.frame = NSRect(x: x, y: y, width: width, height: 20)
+        view.addSubview(label)
+    }
+
+    func configureCheckbox(_ button: NSButton, y: CGFloat, in view: NSView, action: Selector) {
+        button.frame = NSRect(x: 24, y: y, width: 250, height: 24)
+        button.target = self
+        button.action = action
+        view.addSubview(button)
+    }
+
+    func configureField(_ field: NSTextField, x: CGFloat, y: CGFloat, in view: NSView) {
+        field.frame = NSRect(x: x, y: y - 4, width: 78, height: 24)
+        field.alignment = .right
+        field.target = self
+        field.action = #selector(applyNumberSettings)
+        view.addSubview(field)
+    }
+
+    func refresh() {
+        scaleSlider.doubleValue = Double(uiScale)
+        scaleValueLabel.stringValue = "\(Int(round(uiScale * 100)))%"
+        clickAckButton.state = clickAcknowledgesSessions() ? .on : .off
+        smartRedButton.state = (readBoolPreference("smart_red_blink") ?? true) ? .on : .off
+        muteButton.state = (readBoolPreference("muted") ?? false) ? .on : .off
+        redEscalateField.stringValue = "\(Int(readDoublePreference("red_blink_escalate_after_seconds") ?? 30))"
+        doneMinutesField.stringValue = String(format: "%.1f", doneAutoIdleInterval() / 60)
+        staleHoursField.stringValue = String(format: "%.1f", sessionStaleInterval() / 3600)
+    }
+
+    @objc func scaleChanged(_ sender: NSSlider) {
+        appDelegate?.applyScale(CGFloat(sender.doubleValue))
+        scaleValueLabel.stringValue = "\(Int(round(sender.doubleValue * 100)))%"
+    }
+
+    @objc func clickAckChanged(_ sender: NSButton) {
+        updatePreference("click_acknowledges_sessions", value: sender.state == .on)
+    }
+
+    @objc func smartRedChanged(_ sender: NSButton) {
+        updatePreference("smart_red_blink", value: sender.state == .on)
+        appDelegate?.view.needsDisplay = true
+    }
+
+    @objc func muteChanged(_ sender: NSButton) {
+        let wantsMuted = sender.state == .on
+        if appDelegate?.soundController.muted != wantsMuted {
+            appDelegate?.toggleMute()
+        }
+    }
+
+    @objc func applyNumberSettings() {
+        let redSeconds = max(5, redEscalateField.doubleValue)
+        let doneSeconds = max(0.5, doneMinutesField.doubleValue) * 60
+        let staleSeconds = max(0.25, staleHoursField.doubleValue) * 3600
+        updatePreference("red_blink_escalate_after_seconds", value: redSeconds)
+        updatePreference("done_auto_idle_seconds", value: doneSeconds)
+        updatePreference("session_stale_seconds", value: staleSeconds)
+        if appDelegate?.view.state == "done" {
+            appDelegate?.startDoneAutoIdleTimer()
+        }
+        appDelegate?.view.needsDisplay = true
+        refresh()
+    }
+
+    @objc func resetPosition() {
+        appDelegate?.bringWindowBack()
+    }
+
+    @objc func clearSessions() {
+        writeState("idle")
+        appDelegate?.applyState("idle", playPrompt: false, writeFile: false)
+        refresh()
+    }
+
+    @objc func closeSettings() {
+        close()
     }
 }
 
@@ -1162,23 +1569,11 @@ func readState() -> String {
         candidates.append((state, priority))
     }
 
-    if let sessions {
-        let now = Date().timeIntervalSince1970
-        for value in sessions.values {
-            guard let session = value as? [String: Any],
-                  let state = session["state"] as? String,
-                  let priority = statePriority(state) else {
-                continue
+    if sessions != nil {
+        for session in activeSessions() {
+            if let priority = statePriority(session.state) {
+                candidates.append((session.state, priority))
             }
-            let updatedAt = session["updated_at"] as? TimeInterval ?? 0
-            let age = now - updatedAt
-            if state == "done" && age > doneAutoIdleSeconds {
-                continue
-            }
-            if (state == "working" || state == "waiting") && age > sessionStaleSeconds {
-                continue
-            }
-            candidates.append((state, priority))
         }
     }
 
@@ -1199,34 +1594,94 @@ func latestSessionID(for targetState: String) -> String? {
     latestSession(for: targetState)?.id
 }
 
-func latestSession(for targetState: String) -> (id: String, updatedAt: TimeInterval, acknowledgedAt: TimeInterval)? {
+func latestSession(for targetState: String) -> StatusSession? {
+    activeSessions(for: targetState).first
+}
+
+func sessionByID(_ sessionID: String) -> StatusSession? {
     let object = readStateObject()
     guard let sessions = object["sessions"] as? [String: Any] else {
         return nil
     }
+    return makeStatusSession(id: sessionID, value: sessions[sessionID])
+}
 
-    let now = Date().timeIntervalSince1970
-    var latest: (id: String, updatedAt: TimeInterval, acknowledgedAt: TimeInterval)?
-    for (id, value) in sessions {
-        guard let session = value as? [String: Any],
-              let state = session["state"] as? String,
-              state == targetState else {
-            continue
-        }
-        let updatedAt = session["updated_at"] as? TimeInterval ?? 0
-        let age = now - updatedAt
-        if state == "done" && age > doneAutoIdleSeconds {
-            continue
-        }
-        if (state == "working" || state == "waiting") && age > sessionStaleSeconds {
-            continue
-        }
-        if latest == nil || updatedAt > latest!.updatedAt {
-            let acknowledgedAt = session["acknowledged_at"] as? TimeInterval ?? 0
-            latest = (id, updatedAt, acknowledgedAt)
-        }
+func activeSessions(for targetState: String? = nil) -> [StatusSession] {
+    let object = readStateObject()
+    guard let sessions = object["sessions"] as? [String: Any] else {
+        return []
     }
-    return latest
+    var result: [StatusSession] = []
+    for (id, value) in sessions {
+        guard let session = makeStatusSession(id: id, value: value) else {
+            continue
+        }
+        if let targetState, session.state != targetState {
+            continue
+        }
+        guard sessionIsFresh(session) else {
+            continue
+        }
+        result.append(session)
+    }
+    return result.sorted { lhs, rhs in
+        if lhs.updatedAt == rhs.updatedAt {
+            return lhs.id < rhs.id
+        }
+        return lhs.updatedAt > rhs.updatedAt
+    }
+}
+
+func makeStatusSession(id: String, value: Any?) -> StatusSession? {
+    guard let session = value as? [String: Any],
+          let state = session["state"] as? String,
+          statePriority(state) != nil else {
+        return nil
+    }
+    return StatusSession(
+        id: id,
+        state: state,
+        updatedAt: timeIntervalValue(session["updated_at"]),
+        acknowledgedAt: timeIntervalValue(session["acknowledged_at"]),
+        title: stringValue(session["title"]),
+        cwd: stringValue(session["cwd"]),
+        preview: stringValue(session["preview"]),
+        sourceEvent: stringValue(session["source_event"]),
+        toolName: stringValue(session["tool_name"]),
+        model: stringValue(session["model"])
+    )
+}
+
+func sessionIsFresh(_ session: StatusSession) -> Bool {
+    let age = Date().timeIntervalSince1970 - session.updatedAt
+    if session.state == "done" && age > doneAutoIdleInterval() {
+        return false
+    }
+    if (session.state == "working" || session.state == "waiting") && age > sessionStaleInterval() {
+        return false
+    }
+    return true
+}
+
+func timeIntervalValue(_ value: Any?) -> TimeInterval {
+    if let value = value as? TimeInterval {
+        return value
+    }
+    if let value = value as? Int {
+        return TimeInterval(value)
+    }
+    if let value = value as? String, let number = Double(value) {
+        return number
+    }
+    return 0
+}
+
+func stringValue(_ value: Any?) -> String? {
+    guard let value else { return nil }
+    if let string = value as? String {
+        return string
+    }
+    return String(describing: value)
 }
 
 func latestSessionIsAcknowledged(for targetState: String) -> Bool {

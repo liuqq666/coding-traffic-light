@@ -18,15 +18,26 @@ import os
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 
 STATE_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "state.json"
 PREFERENCES_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "preferences.json"
 STATES = {"working", "done", "waiting", "idle"}
-COMMANDS = {"quit", "show", "reset-position", "clear-sessions"}
+COMMANDS = {"quit", "show", "reset-position", "clear-sessions", "settings"}
 DONE_TTL_SECONDS = 10 * 60
 SESSION_TTL_SECONDS = 6 * 60 * 60
 PRIORITY = {"waiting": 3, "working": 2, "done": 1, "idle": 0}
+SESSION_METADATA_KEYS = (
+    "title",
+    "cwd",
+    "preview",
+    "source_event",
+    "tool_name",
+    "turn_id",
+    "transcript_path",
+    "model",
+)
 
 
 def ensure_runtime() -> None:
@@ -48,7 +59,23 @@ def read_payload() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def session_id_from_env() -> str | None:
+def read_preferences() -> dict:
+    try:
+        payload = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def preference_number(key: str, default: float) -> float:
+    value = read_preferences().get(key)
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def session_id_from_env() -> Optional[str]:
     for key in ("CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CONVERSATION_ID", "CODEX_TASK_ID"):
         value = os.environ.get(key)
         if value:
@@ -61,6 +88,8 @@ def aggregate_state(payload: dict) -> str:
     candidates: list[str] = []
     sessions = payload.get("sessions")
     manual_state = payload.get("manual_state")
+    done_ttl_seconds = max(10, preference_number("done_auto_idle_seconds", DONE_TTL_SECONDS))
+    session_ttl_seconds = max(60, preference_number("session_stale_seconds", SESSION_TTL_SECONDS))
     if manual_state in STATES:
         candidates.append(manual_state)
     elif not isinstance(sessions, dict) and payload.get("state") in STATES:
@@ -73,9 +102,9 @@ def aggregate_state(payload: dict) -> str:
             session_state = item.get("state")
             updated_at = float(item.get("updated_at") or 0)
             age = now - updated_at
-            if session_state == "done" and age > DONE_TTL_SECONDS:
+            if session_state == "done" and age > done_ttl_seconds:
                 continue
-            if session_state in {"working", "waiting"} and age > SESSION_TTL_SECONDS:
+            if session_state in {"working", "waiting"} and age > session_ttl_seconds:
                 continue
             if session_state in STATES:
                 candidates.append(session_state)
@@ -85,7 +114,31 @@ def aggregate_state(payload: dict) -> str:
     return max(candidates, key=lambda item: PRIORITY[item])
 
 
-def write_state(state: str, session_id: str | None = None) -> None:
+def compact_text(value: object, limit: int = 180) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def metadata_from_args(args: argparse.Namespace) -> dict:
+    metadata = {}
+    for key in SESSION_METADATA_KEYS:
+        value = compact_text(getattr(args, key, None), 300 if key in {"cwd", "transcript_path"} else 180)
+        if value:
+            metadata[key] = value
+    return metadata
+
+
+def write_state(state: str, session_id: Optional[str] = None, metadata: Optional[dict] = None) -> None:
     if state not in STATES:
         raise SystemExit(f"Unknown state: {state}")
     payload = read_payload()
@@ -98,7 +151,12 @@ def write_state(state: str, session_id: str | None = None) -> None:
         if state == "idle":
             sessions.pop(session_id, None)
         else:
-            sessions[session_id] = {"state": state, "updated_at": now}
+            previous = sessions.get(session_id)
+            item = previous.copy() if isinstance(previous, dict) else {}
+            item.update({"state": state, "updated_at": now})
+            for key, value in (metadata or {}).items():
+                item[key] = value
+            sessions[session_id] = item
         payload["sessions"] = sessions
         payload["state"] = aggregate_state(payload)
     else:
@@ -145,6 +203,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Codex Status Light command helper")
     parser.add_argument("command", choices=[*sorted(STATES), *sorted(COMMANDS), "status"], help="State command")
     parser.add_argument("--session", default=None, help="Session id for multi-session aggregation")
+    parser.add_argument("--title", default=None, help="Session title shown in menus")
+    parser.add_argument("--cwd", default=None, help="Session working directory")
+    parser.add_argument("--preview", default=None, help="Short session preview")
+    parser.add_argument("--source-event", default=None, help="Codex hook event name")
+    parser.add_argument("--tool-name", default=None, help="Codex tool name")
+    parser.add_argument("--turn-id", default=None, help="Codex turn id")
+    parser.add_argument("--transcript-path", default=None, help="Codex transcript path")
+    parser.add_argument("--model", default=None, help="Codex model")
     return parser.parse_args()
 
 
@@ -159,7 +225,7 @@ def main() -> int:
         write_command(args.command)
         print(args.command)
         return 0
-    write_state(args.command, args.session or session_id_from_env())
+    write_state(args.command, args.session or session_id_from_env(), metadata_from_args(args))
     print(args.command)
     return 0
 
