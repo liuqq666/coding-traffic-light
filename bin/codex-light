@@ -1,42 +1,150 @@
-#!/usr/bin/env python3
+#!/bin/sh
+''':'
+PYTHON="${CODEX_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  CODEX_BUNDLED_PYTHON="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+  if [ -x "$CODEX_BUNDLED_PYTHON" ]; then
+    PYTHON="$CODEX_BUNDLED_PYTHON"
+  else
+    PYTHON="python3"
+  fi
+fi
+exec "$PYTHON" "$0" "$@"
+':'''
 """Command helper for Codex Status Light."""
 
-from __future__ import annotations
-
 import argparse
+import os
 import json
 import time
 from pathlib import Path
 
 
 STATE_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "state.json"
-STATES = {"working", "done", "waiting", "idle", "quit"}
+PREFERENCES_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "preferences.json"
+STATES = {"working", "done", "waiting", "idle"}
+COMMANDS = {"quit", "show", "reset-position", "clear-sessions"}
+DONE_TTL_SECONDS = 10 * 60
+SESSION_TTL_SECONDS = 6 * 60 * 60
+PRIORITY = {"waiting": 3, "working": 2, "done": 1, "idle": 0}
 
 
 def ensure_runtime() -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
-def write_state(state: str) -> None:
-    if state not in STATES:
-        raise SystemExit(f"Unknown state: {state}")
+def atomic_write_json(path: Path, payload: dict) -> None:
     ensure_runtime()
-    payload = {"state": state, "updated_at": time.time()}
-    STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
-def read_state() -> str:
+def read_payload() -> dict:
     try:
         payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def session_id_from_env() -> str | None:
+    for key in ("CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CONVERSATION_ID", "CODEX_TASK_ID"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
+def aggregate_state(payload: dict) -> str:
+    now = time.time()
+    candidates: list[str] = []
+    sessions = payload.get("sessions")
+    manual_state = payload.get("manual_state")
+    if manual_state in STATES:
+        candidates.append(manual_state)
+    elif not isinstance(sessions, dict) and payload.get("state") in STATES:
+        candidates.append(payload["state"])
+
+    if isinstance(sessions, dict):
+        for item in sessions.values():
+            if not isinstance(item, dict):
+                continue
+            session_state = item.get("state")
+            updated_at = float(item.get("updated_at") or 0)
+            age = now - updated_at
+            if session_state == "done" and age > DONE_TTL_SECONDS:
+                continue
+            if session_state in {"working", "waiting"} and age > SESSION_TTL_SECONDS:
+                continue
+            if session_state in STATES:
+                candidates.append(session_state)
+
+    if not candidates:
         return "idle"
-    state = payload.get("state", "idle")
-    return state if state in STATES else "idle"
+    return max(candidates, key=lambda item: PRIORITY[item])
+
+
+def write_state(state: str, session_id: str | None = None) -> None:
+    if state not in STATES:
+        raise SystemExit(f"Unknown state: {state}")
+    payload = read_payload()
+    now = time.time()
+
+    if session_id:
+        sessions = payload.get("sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        if state == "idle":
+            sessions.pop(session_id, None)
+        else:
+            sessions[session_id] = {"state": state, "updated_at": now}
+        payload["sessions"] = sessions
+        payload["state"] = aggregate_state(payload)
+    else:
+        payload["manual_state"] = state
+        payload["state"] = state
+
+    payload["updated_at"] = now
+    payload.pop("command", None)
+    atomic_write_json(STATE_FILE, payload)
+
+
+def write_command(command: str) -> None:
+    payload = read_payload()
+    payload["command"] = command
+    payload["updated_at"] = time.time()
+    if command == "clear-sessions":
+        payload["sessions"] = {}
+        payload["state"] = aggregate_state(payload)
+    elif command == "quit":
+        payload["state"] = "quit"
+    else:
+        payload["state"] = aggregate_state(payload)
+    atomic_write_json(STATE_FILE, payload)
+
+
+def reset_position_preference() -> None:
+    try:
+        prefs = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(prefs, dict):
+            prefs = {}
+    except Exception:
+        prefs = {}
+    prefs.pop("window_x", None)
+    prefs.pop("window_y", None)
+    prefs["updated_at"] = time.time()
+    atomic_write_json(PREFERENCES_FILE, prefs)
+
+
+def read_state() -> str:
+    return aggregate_state(read_payload())
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Codex Status Light command helper")
-    parser.add_argument("command", choices=[*sorted(STATES), "status"], help="State command")
+    parser.add_argument("command", choices=[*sorted(STATES), *sorted(COMMANDS), "status"], help="State command")
+    parser.add_argument("--session", default=None, help="Session id for multi-session aggregation")
     return parser.parse_args()
 
 
@@ -45,7 +153,13 @@ def main() -> int:
     if args.command == "status":
         print(read_state())
         return 0
-    write_state(args.command)
+    if args.command in COMMANDS:
+        if args.command == "reset-position":
+            reset_position_preference()
+        write_command(args.command)
+        print(args.command)
+        return 0
+    write_state(args.command, args.session or session_id_from_env())
     print(args.command)
     return 0
 

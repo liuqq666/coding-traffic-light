@@ -1,6 +1,16 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
+#!/bin/sh
+''':'
+PYTHON="${CODEX_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  CODEX_BUNDLED_PYTHON="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+  if [ -x "$CODEX_BUNDLED_PYTHON" ]; then
+    PYTHON="$CODEX_BUNDLED_PYTHON"
+  else
+    PYTHON="python3"
+  fi
+fi
+exec "$PYTHON" "$0" "$@"
+':'''
 import json
 import os
 import re
@@ -39,16 +49,22 @@ def read_event() -> dict:
         return {}
 
 
-def current_state() -> str | None:
-    try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8")).get("state")
-    except Exception:
-        return None
+def session_id(event: dict) -> str:
+    for key in ("session_id", "thread_id", "conversation_id", "task_id"):
+        value = event.get(key)
+        if value:
+            return str(value)
+    for key in ("CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CONVERSATION_ID", "CODEX_TASK_ID"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    cwd = event.get("cwd") or os.environ.get("PWD") or "unknown"
+    return f"hook:{cwd}"
 
 
-def set_light(state: str) -> None:
+def set_light(state: str, event: dict) -> None:
     try:
-        subprocess.run([LIGHT, state], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run([LIGHT, state, "--session", session_id(event)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         log(f"set {state}")
     except Exception as exc:
         log(f"set-failed {state} {exc}")
@@ -74,17 +90,20 @@ def looks_waiting(message: str) -> bool:
 
 event = read_event()
 name = event.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "")
-log(f"event {name}")
+log(f"event {name} session={session_id(event)} keys={','.join(sorted(event.keys()))}")
 
 if name in {"UserPromptSubmit", "PreToolUse"}:
-    set_light("working")
+    set_light("working", event)
 elif name == "PermissionRequest":
-    set_light("waiting")
+    set_light("waiting", event)
 elif name in {"Stop", "SubagentStop"}:
     message = event.get("last_assistant_message") or ""
-    if current_state() == "waiting" or looks_waiting(message):
-        set_light("waiting")
+    session = session_id(event)
+    if looks_waiting(message):
+        subprocess.run([LIGHT, "waiting", "--session", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        log("set waiting")
     else:
-        set_light("done")
+        subprocess.run([LIGHT, "done", "--session", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        log("set done")
 
 print("{}")
