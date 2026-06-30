@@ -16,6 +16,7 @@ exec "$PYTHON" "$0" "$@"
 import argparse
 import os
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,10 @@ from typing import Optional
 
 STATE_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "state.json"
 PREFERENCES_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "preferences.json"
+CODEX_HOME = Path.home() / ".codex"
+CODEX_STATE_DB = CODEX_HOME / "state_5.sqlite"
+CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+CODEX_ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
 STATES = {"working", "done", "waiting", "idle"}
 COMMANDS = {"quit", "show", "reset-position", "clear-sessions", "settings"}
 DONE_TTL_SECONDS = 10 * 60
@@ -96,11 +101,16 @@ def aggregate_state(payload: dict) -> str:
         candidates.append(payload["state"])
 
     if isinstance(sessions, dict):
-        for item in sessions.values():
+        for session_id, item in sessions.items():
             if not isinstance(item, dict):
+                continue
+            if not session_openable(session_id, item):
                 continue
             session_state = item.get("state")
             updated_at = float(item.get("updated_at") or 0)
+            acknowledged_at = float(item.get("acknowledged_at") or 0)
+            if acknowledged_at >= updated_at:
+                continue
             age = now - updated_at
             if session_state == "done" and age > done_ttl_seconds:
                 continue
@@ -112,6 +122,53 @@ def aggregate_state(payload: dict) -> str:
     if not candidates:
         return "idle"
     return max(candidates, key=lambda item: PRIORITY[item])
+
+
+def is_uuid(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 36:
+        return False
+    hyphens = {8, 13, 18, 23}
+    for index, char in enumerate(value):
+        if index in hyphens:
+            if char != "-":
+                return False
+        elif char.lower() not in "0123456789abcdef":
+            return False
+    return True
+
+
+def session_openable(session_id: str, item: dict) -> bool:
+    if not is_uuid(session_id):
+        return True
+    if directory_contains_session_id(CODEX_ARCHIVED_SESSIONS_DIR, session_id):
+        return False
+    archived = sqlite_thread_archived(session_id)
+    if archived is not None:
+        return not archived
+    transcript_path = item.get("transcript_path")
+    if isinstance(transcript_path, str) and "/.codex/sessions/" in transcript_path and Path(transcript_path).exists():
+        return True
+    return directory_contains_session_id(CODEX_SESSIONS_DIR, session_id)
+
+
+def sqlite_thread_archived(session_id: str) -> Optional[bool]:
+    if not CODEX_STATE_DB.exists():
+        return None
+    try:
+        with sqlite3.connect(f"file:{CODEX_STATE_DB}?mode=ro", uri=True, timeout=0.2) as connection:
+            row = connection.execute("SELECT archived FROM threads WHERE id = ? LIMIT 1", (session_id,)).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    return bool(row[0])
+
+
+def directory_contains_session_id(directory: Path, session_id: str) -> bool:
+    try:
+        return any(session_id in item.name for item in directory.iterdir())
+    except Exception:
+        return False
 
 
 def compact_text(value: object, limit: int = 180) -> Optional[str]:
@@ -156,6 +213,7 @@ def write_state(state: str, session_id: Optional[str] = None, metadata: Optional
             item.update({"state": state, "updated_at": now})
             for key, value in (metadata or {}).items():
                 item[key] = value
+            item["id"] = session_id
             sessions[session_id] = item
         payload["sessions"] = sessions
         payload["state"] = aggregate_state(payload)

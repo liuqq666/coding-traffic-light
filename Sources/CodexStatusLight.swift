@@ -5,6 +5,11 @@ let supportDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/CodexStatusLight")
 let stateFile = supportDir.appendingPathComponent("state.json")
 let preferencesFile = supportDir.appendingPathComponent("preferences.json")
+let codexHomeDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+let codexStateDatabase = codexHomeDir.appendingPathComponent("state_5.sqlite")
+let codexSessionsDir = codexHomeDir.appendingPathComponent("sessions")
+let codexArchivedSessionsDir = codexHomeDir.appendingPathComponent("archived_sessions")
+var codexThreadOpenabilityCache: [String: (openable: Bool, checkedAt: TimeInterval)] = [:]
 
 let labels: [String: String] = [
     "working": "正在干活",
@@ -61,7 +66,7 @@ func blinkFrequency(for light: String) -> CGFloat {
 
 func effectiveBlinkFrequency(for light: String) -> CGFloat {
     guard light == "red", readBoolPreference("smart_red_blink") ?? true,
-          let waiting = latestSession(for: "waiting"),
+          let waiting = latestAttentionSession(for: "waiting"),
           !waiting.isAcknowledged else {
         return blinkFrequency(for: light)
     }
@@ -113,6 +118,7 @@ struct StatusSession {
     let sourceEvent: String?
     let toolName: String?
     let model: String?
+    let transcriptPath: String?
 
     var isAcknowledged: Bool {
         acknowledgedAt >= updatedAt
@@ -295,8 +301,8 @@ final class TrafficLightView: NSView {
         transform.scale(by: uiScale)
         transform.concat()
 
-        if let image = Self.realTrafficLightImages[state] ?? Self.realTrafficLightImages["idle"] {
-            drawPhotoTrafficLight(image)
+        if Self.realTrafficLightImages["idle"] != nil {
+            drawPhotoTrafficLight()
         } else {
             let body = NSRect(x: 14, y: 8, width: 134, height: 368)
             drawHousing(body)
@@ -314,21 +320,31 @@ final class TrafficLightView: NSView {
     }
 
     func activeLight() -> String {
-        switch state {
-        case "working": return "yellow"
-        case "done": return "green"
-        case "waiting": return "red"
-        default: return ""
+        visibleLights().first ?? ""
+    }
+
+    func visibleLights() -> [String] {
+        var lights: [String] = []
+        for light in ["red", "yellow", "green"] where lightNeedsAttention(light) {
+            lights.append(light)
         }
+        if lights.isEmpty, readStateObject()["manual_state"] != nil {
+            switch state {
+            case "waiting": return ["red"]
+            case "working": return ["yellow"]
+            case "done": return ["green"]
+            default: return []
+            }
+        }
+        return lights
     }
 
     func isLightVisible(_ light: String) -> Bool {
-        guard activeLight() == light else { return false }
-        return true
+        visibleLights().contains(light)
     }
 
     func intensity(for light: String) -> CGFloat {
-        guard activeLight() == light else { return state == "idle" ? 0.04 : 0.10 }
+        guard isLightVisible(light) else { return 0.10 }
         if shouldBlink(for: light) {
             let cycle = fmod(animationPhase * effectiveBlinkFrequency(for: light), 1)
             if cycle < 0.5 {
@@ -376,20 +392,29 @@ final class TrafficLightView: NSView {
         path.stroke()
     }
 
-    func drawPhotoTrafficLight(_ image: NSImage) {
+    func drawPhotoTrafficLight() {
         let imageRect = NSRect(x: 12, y: 5, width: 138, height: 378)
-        let active = activeLight()
-        if !active.isEmpty, shouldBlink(for: active), let idleImage = Self.realTrafficLightImages["idle"] {
-            idleImage.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
-            image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: intensity(for: active), respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
-        } else {
-            image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
+        let idleImage = Self.realTrafficLightImages["idle"]
+        idleImage?.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
+
+        for light in ["red", "yellow", "green"] where isLightVisible(light) {
+            let stateImage = Self.realTrafficLightImages[stateName(for: light)]
+            guard let stateImage else { continue }
+            let sectionRect = photoLampSectionRect(for: light, imageRect: imageRect)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: sectionRect).addClip()
+            stateImage.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: intensity(for: light), respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
+            NSGraphicsContext.restoreGraphicsState()
         }
     }
 
     func shouldBlink(for light: String) -> Bool {
         guard isBlinkEnabled(for: light) else { return false }
-        return !latestSessionIsAcknowledged(for: stateName(for: light))
+        return lightNeedsAttention(light)
+    }
+
+    func lightNeedsAttention(_ light: String) -> Bool {
+        !attentionSessions(for: stateName(for: light)).isEmpty
     }
 
     func hasOpenFeedback() -> Bool {
@@ -439,6 +464,19 @@ final class TrafficLightView: NSView {
         let center = NSPoint(x: imageRect.midX, y: imageRect.minY + imageRect.height * normalizedY)
         let radius = imageRect.height * 0.114
         return NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
+    }
+
+    func photoLampSectionRect(for light: String, imageRect: NSRect) -> NSRect {
+        switch light {
+        case "red":
+            return NSRect(x: imageRect.minX, y: imageRect.minY + imageRect.height * 0.665, width: imageRect.width, height: imageRect.height * 0.335)
+        case "yellow":
+            return NSRect(x: imageRect.minX, y: imageRect.minY + imageRect.height * 0.335, width: imageRect.width, height: imageRect.height * 0.335)
+        case "green":
+            return NSRect(x: imageRect.minX, y: imageRect.minY, width: imageRect.width, height: imageRect.height * 0.36)
+        default:
+            return imageRect
+        }
     }
 
     func drawPhotoLampBreath(in rect: NSRect, color: NSColor, intensity: CGFloat) {
@@ -976,7 +1014,7 @@ final class TrafficLightView: NSView {
     func openClickedLampSession(with event: NSEvent) -> Bool {
         guard let light = lampAtEvent(event) else { return false }
         let targetState = stateName(for: light)
-        guard let session = latestSession(for: targetState) else {
+        guard let session = latestAttentionSession(for: targetState) else {
             NSSound.beep()
             return true
         }
@@ -1004,8 +1042,9 @@ final class TrafficLightView: NSView {
     func showLampSessionMenu(with event: NSEvent, light: String) {
         let targetState = stateName(for: light)
         let sessions = activeSessions(for: targetState)
+        let unreadCount = attentionSessions(for: targetState).count
         let menu = NSMenu()
-        let header = NSMenuItem(title: "\(displayName(for: light))：\(sessions.count) 个会话", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "\(displayName(for: light))：\(unreadCount) 未查看 / \(sessions.count) 活跃", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
@@ -1014,7 +1053,7 @@ final class TrafficLightView: NSView {
             empty.isEnabled = false
             menu.addItem(empty)
         } else {
-            let latest = sessions[0]
+            let latest = attentionSessions(for: targetState).first ?? sessions[0]
             addSessionMenuItem(to: menu, title: "打开最新：\(latest.displayTitle)", session: latest, light: light)
             let acknowledgeAll = NSMenuItem(title: "全部标记已查看", action: #selector(acknowledgeSessionsFromMenu(_:)), keyEquivalent: "")
             acknowledgeAll.target = self
@@ -1224,9 +1263,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func animateLights() {
-        let active = view.activeLight()
         var shouldRedraw = false
-        if !active.isEmpty, view.shouldBlink(for: active) {
+        if view.visibleLights().contains(where: { view.shouldBlink(for: $0) }) {
             view.animationPhase += 1.0 / 30.0
             if view.animationPhase > 3600 {
                 view.animationPhase = 0
@@ -1570,7 +1608,7 @@ func readState() -> String {
     }
 
     if sessions != nil {
-        for session in activeSessions() {
+        for session in attentionSessions() {
             if let priority = statePriority(session.state) {
                 candidates.append((session.state, priority))
             }
@@ -1598,12 +1636,20 @@ func latestSession(for targetState: String) -> StatusSession? {
     activeSessions(for: targetState).first
 }
 
+func latestAttentionSession(for targetState: String) -> StatusSession? {
+    attentionSessions(for: targetState).first
+}
+
 func sessionByID(_ sessionID: String) -> StatusSession? {
     let object = readStateObject()
     guard let sessions = object["sessions"] as? [String: Any] else {
         return nil
     }
-    return makeStatusSession(id: sessionID, value: sessions[sessionID])
+    guard let session = makeStatusSession(id: sessionID, value: sessions[sessionID]),
+          sessionIsFresh(session) else {
+        return nil
+    }
+    return session
 }
 
 func activeSessions(for targetState: String? = nil) -> [StatusSession] {
@@ -1632,6 +1678,10 @@ func activeSessions(for targetState: String? = nil) -> [StatusSession] {
     }
 }
 
+func attentionSessions(for targetState: String? = nil) -> [StatusSession] {
+    activeSessions(for: targetState).filter { !$0.isAcknowledged }
+}
+
 func makeStatusSession(id: String, value: Any?) -> StatusSession? {
     guard let session = value as? [String: Any],
           let state = session["state"] as? String,
@@ -1648,17 +1698,112 @@ func makeStatusSession(id: String, value: Any?) -> StatusSession? {
         preview: stringValue(session["preview"]),
         sourceEvent: stringValue(session["source_event"]),
         toolName: stringValue(session["tool_name"]),
-        model: stringValue(session["model"])
+        model: stringValue(session["model"]),
+        transcriptPath: stringValue(session["transcript_path"])
     )
 }
 
 func sessionIsFresh(_ session: StatusSession) -> Bool {
+    guard sessionIsOpenable(session) else {
+        return false
+    }
     let age = Date().timeIntervalSince1970 - session.updatedAt
     if session.state == "done" && age > doneAutoIdleInterval() {
         return false
     }
     if (session.state == "working" || session.state == "waiting") && age > sessionStaleInterval() {
         return false
+    }
+    return true
+}
+
+func sessionIsOpenable(_ session: StatusSession) -> Bool {
+    guard isUUIDString(session.id) else {
+        return true
+    }
+    let now = Date().timeIntervalSince1970
+    if let cached = codexThreadOpenabilityCache[session.id], now - cached.checkedAt < 5 {
+        return cached.openable
+    }
+
+    let openable = queryCodexThreadOpenability(session)
+    codexThreadOpenabilityCache[session.id] = (openable, now)
+    return openable
+}
+
+func queryCodexThreadOpenability(_ session: StatusSession) -> Bool {
+    if archivedRolloutExists(for: session.id) {
+        return false
+    }
+    if let archived = sqliteThreadArchived(session.id) {
+        return !archived
+    }
+    if activeRolloutExists(for: session) {
+        return true
+    }
+    return false
+}
+
+func sqliteThreadArchived(_ sessionID: String) -> Bool? {
+    guard FileManager.default.fileExists(atPath: codexStateDatabase.path) else {
+        return nil
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    let escapedID = sessionID.replacingOccurrences(of: "'", with: "''")
+    process.arguments = ["-readonly", codexStateDatabase.path, "SELECT archived FROM threads WHERE id = '\(escapedID)' LIMIT 1;"]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return nil
+    }
+    guard process.terminationStatus == 0 else {
+        return nil
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if output == "1" {
+        return true
+    }
+    if output == "0" {
+        return false
+    }
+    return nil
+}
+
+func activeRolloutExists(for session: StatusSession) -> Bool {
+    if let transcriptPath = session.transcriptPath,
+       transcriptPath.contains("/.codex/sessions/"),
+       FileManager.default.fileExists(atPath: transcriptPath) {
+        return true
+    }
+    return directoryContainsSessionID(codexSessionsDir, sessionID: session.id)
+}
+
+func archivedRolloutExists(for sessionID: String) -> Bool {
+    directoryContainsSessionID(codexArchivedSessionsDir, sessionID: sessionID)
+}
+
+func directoryContainsSessionID(_ directory: URL, sessionID: String) -> Bool {
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+        return false
+    }
+    return entries.contains { $0.contains(sessionID) }
+}
+
+func isUUIDString(_ value: String) -> Bool {
+    guard value.count == 36 else { return false }
+    let hyphenOffsets = Set([8, 13, 18, 23])
+    for (index, char) in value.enumerated() {
+        if hyphenOffsets.contains(index) {
+            if char != "-" { return false }
+        } else if !char.isHexDigit {
+            return false
+        }
     }
     return true
 }
