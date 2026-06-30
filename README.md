@@ -23,6 +23,24 @@
 
 ## 安装
 
+### 一键安装配置
+
+把下面这一行复制给 Codex 执行，它会自动下载安装到 `~/.codex/codex-status-light`，并完成编译、开机自启、命令安装和 Codex hooks 配置：
+
+```bash
+/bin/zsh -lc 'set -e; d="$HOME/.codex/codex-status-light"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/liuqq666/coding-traffic-light.git "$d"; fi; cd "$d"; ./install.command'
+```
+
+首次使用 hooks 时，Codex 会要求你信任一次。出现提示时，在 Codex 里运行：
+
+```text
+/hooks
+```
+
+按提示确认即可。这个信任步骤是 Codex 对非托管 command hooks 的安全确认，普通安装脚本不会替你绕过；hooks 新增或变化后也需要重新确认。
+
+### 手动安装
+
 下载后双击根目录里的：
 
 ```text
@@ -35,14 +53,6 @@ install.command
 - 设置开机自动启动。
 - 安装 `codex-light` / `codex-light-run` / `codex-light-hook` 命令。
 - 把 Codex hooks 写入 `~/.codex/config.toml`。
-
-最后打开 Codex，运行一次：
-
-```text
-/hooks
-```
-
-按提示信任这些 hooks。之后用 Codex 时状态灯就会自动变化。
 
 也可以用命令行安装：
 
@@ -113,6 +123,7 @@ codex-light-run python3 script.py
 - `PermissionRequest`：红灯。
 - `Stop` / `SubagentStop`：绿灯；如果最后回复像是在等待用户，则保持红灯。
 - hooks 会记录会话 id、工作目录、事件来源、工具名和一段摘要，用于右键会话菜单。
+- 如果 transcript 里已有 `token_count`，会记录 5 小时额度余量和重刷时间。
 
 多会话按独立会话管理：
 
@@ -131,6 +142,7 @@ codex-light-run python3 script.py
 - 右键某个灯面：列出该状态下所有非归档活跃会话，可以选择打开或全部标记已查看。
 - 点击打开会话后，会把这条会话标记为已查看，该条闪烁会停止；后续有新事件时会重新提醒。
 - 右键灯外：打开全局菜单，可以切换状态、调整大小、设置闪烁、打开设置窗口、静音或退出。
+- 右侧 `5H` 竖条：显示 5 小时额度剩余百分比和本地重刷时间；可在全局菜单或设置窗口关闭，默认开启。
 - 左下角拖拽：按比例缩放浮窗。
 
 ## 设置
@@ -140,6 +152,7 @@ codex-light-run python3 script.py
 - 浮窗大小。
 - 点击会话后是否停止闪烁。
 - 红灯未处理后是否自动加快。
+- 是否显示 5H 额度。
 - 红灯加快阈值。
 - 绿灯自动变暗时间。
 - 会话过期时间。

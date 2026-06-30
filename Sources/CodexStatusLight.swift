@@ -19,8 +19,10 @@ let labels: [String: String] = [
 ]
 
 let stateOrder = ["working", "done", "waiting", "idle"]
-let designWidth: CGFloat = 162
-let designHeight: CGFloat = 384
+let baseDesignWidth: CGFloat = 162
+let baseDesignHeight: CGFloat = 384
+let fiveHourQuotaPanelWidth: CGFloat = 48
+let fiveHourQuotaPreferenceKey = "five_hour_quota_visible"
 var uiScale: CGFloat = readCGFloatPreference("scale") ?? 0.74
 let minUIScale: CGFloat = 0.48
 let maxUIScale: CGFloat = 1.35
@@ -29,7 +31,19 @@ let defaultSessionStaleSeconds: TimeInterval = 6 * 60 * 60
 let realTrafficLightAssetPrefix = "traffic-light-real"
 
 func currentWindowSize() -> NSSize {
-    NSSize(width: designWidth * uiScale, height: designHeight * uiScale)
+    NSSize(width: currentDesignWidth() * uiScale, height: currentDesignHeight() * uiScale)
+}
+
+func currentDesignWidth() -> CGFloat {
+    baseDesignWidth + (fiveHourQuotaVisible() ? fiveHourQuotaPanelWidth : 0)
+}
+
+func currentDesignHeight() -> CGFloat {
+    baseDesignHeight
+}
+
+func fiveHourQuotaVisible() -> Bool {
+    readBoolPreference(fiveHourQuotaPreferenceKey) ?? true
 }
 
 func clampedOriginForVisibleScreen(_ origin: NSPoint, size: NSSize) -> NSPoint {
@@ -119,9 +133,30 @@ struct StatusSession {
     let toolName: String?
     let model: String?
     let transcriptPath: String?
+    let rateLimitPrimaryUsedPercent: Double?
+    let rateLimitPrimaryRemainingPercent: Double?
+    let rateLimitPrimaryResetsAt: TimeInterval?
+    let rateLimitPrimaryWindowMinutes: Double?
+    let rateLimitName: String?
+    let rateLimitPlanType: String?
 
     var isAcknowledged: Bool {
         acknowledgedAt >= updatedAt
+    }
+
+    var fiveHourQuota: FiveHourQuota? {
+        guard let resetsAt = rateLimitPrimaryResetsAt else { return nil }
+        let window = rateLimitPrimaryWindowMinutes ?? 300
+        guard window >= 295 && window <= 305 else { return nil }
+        let remaining = rateLimitPrimaryRemainingPercent ?? rateLimitPrimaryUsedPercent.map { 100 - $0 }
+        guard let remaining else { return nil }
+        return FiveHourQuota(
+            remainingPercent: min(max(remaining, 0), 100),
+            usedPercent: min(max(rateLimitPrimaryUsedPercent ?? 100 - remaining, 0), 100),
+            resetsAt: resetsAt,
+            limitName: rateLimitName,
+            planType: rateLimitPlanType
+        )
     }
 
     var displayTitle: String {
@@ -146,7 +181,33 @@ struct StatusSession {
     }
 
     var menuTitle: String {
-        "\(displayTitle)  \(detailTitle)"
+        if let quota = fiveHourQuota {
+            return "\(displayTitle)  \(detailTitle)  · 5H \(quota.percentText) \(quota.resetTimeText)"
+        }
+        return "\(displayTitle)  \(detailTitle)"
+    }
+}
+
+struct FiveHourQuota {
+    let remainingPercent: Double
+    let usedPercent: Double
+    let resetsAt: TimeInterval
+    let limitName: String?
+    let planType: String?
+
+    var percentText: String {
+        "\(Int(round(remainingPercent)))%"
+    }
+
+    var resetTimeText: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: Date(timeIntervalSince1970: resetsAt))
+    }
+
+    var detailText: String {
+        "5H 剩余 \(percentText)，\(resetTimeText) 重刷"
     }
 }
 
@@ -311,6 +372,7 @@ final class TrafficLightView: NSView {
             drawLamp(center: NSPoint(x: 81, y: 78), light: "green", intensity: intensity(for: "green"))
         }
 
+        drawFiveHourQuotaPanel()
         drawOpenFeedback()
         NSGraphicsContext.restoreGraphicsState()
 
@@ -393,7 +455,7 @@ final class TrafficLightView: NSView {
     }
 
     func drawPhotoTrafficLight() {
-        let imageRect = NSRect(x: 12, y: 5, width: 138, height: 378)
+        let imageRect = photoImageRect()
         let idleImage = Self.realTrafficLightImages["idle"]
         idleImage?.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
 
@@ -406,6 +468,86 @@ final class TrafficLightView: NSView {
             stateImage.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: intensity(for: light), respectFlipped: false, hints: [.interpolation: NSImageInterpolation.high])
             NSGraphicsContext.restoreGraphicsState()
         }
+    }
+
+    func photoImageRect() -> NSRect {
+        NSRect(x: 12, y: 5, width: 138, height: 378)
+    }
+
+    func fiveHourQuotaPanelRect() -> NSRect {
+        NSRect(x: baseDesignWidth + 3, y: 18, width: fiveHourQuotaPanelWidth - 10, height: baseDesignHeight - 36)
+    }
+
+    func drawFiveHourQuotaPanel() {
+        guard fiveHourQuotaVisible() else { return }
+
+        let rect = fiveHourQuotaPanelRect()
+        let quota = latestFiveHourQuota()
+        let accent = quotaAccentColor(for: quota)
+        let panel = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+
+        NSGraphicsContext.saveGraphicsState()
+        panel.addClip()
+        NSGradient(colors: [
+            NSColor(hex: "#171a19"),
+            NSColor(hex: "#050606")
+        ])?.draw(in: rect, angle: 0)
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSColor.black.withAlphaComponent(0.82).setStroke()
+        panel.lineWidth = 1.2
+        panel.stroke()
+
+        NSColor.white.withAlphaComponent(0.08).setStroke()
+        let inner = NSBezierPath(roundedRect: rect.insetBy(dx: 1.4, dy: 1.4), xRadius: 4, yRadius: 4)
+        inner.lineWidth = 0.8
+        inner.stroke()
+
+        let track = NSRect(x: rect.midX - 4, y: rect.minY + 58, width: 8, height: rect.height - 116)
+        NSColor.white.withAlphaComponent(0.10).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
+        if let quota {
+            let fillHeight = max(8, track.height * CGFloat(quota.remainingPercent / 100.0))
+            let fill = NSRect(x: track.minX, y: track.minY, width: track.width, height: fillHeight)
+            accent.withAlphaComponent(0.78).setFill()
+            NSBezierPath(roundedRect: fill, xRadius: 4, yRadius: 4).fill()
+
+            accent.withAlphaComponent(0.22).setFill()
+            NSBezierPath(ovalIn: NSRect(x: track.midX - 7, y: fill.maxY - 7, width: 14, height: 14)).fill()
+        }
+
+        drawQuotaText("5H", in: NSRect(x: rect.minX + 3, y: rect.maxY - 29, width: rect.width - 6, height: 16), accent: accent, size: 11.5, weight: .semibold)
+        if let quota {
+            drawQuotaText(quota.percentText, in: NSRect(x: rect.minX + 2, y: rect.midY - 9, width: rect.width - 4, height: 18), accent: accent, size: 10.5, weight: .medium)
+            drawQuotaText(quota.resetTimeText, in: NSRect(x: rect.minX + 2, y: rect.minY + 19, width: rect.width - 4, height: 14), accent: accent, size: 8.2, weight: .regular)
+            drawQuotaText("重刷", in: NSRect(x: rect.minX + 2, y: rect.minY + 6, width: rect.width - 4, height: 12), accent: NSColor(hex: "#8c9494"), size: 8.0, weight: .regular)
+        } else {
+            drawQuotaText("等待", in: NSRect(x: rect.minX + 2, y: rect.midY - 9, width: rect.width - 4, height: 18), accent: accent, size: 9.0, weight: .regular)
+        }
+    }
+
+    func quotaAccentColor(for quota: FiveHourQuota?) -> NSColor {
+        guard let quota else {
+            return NSColor(hex: "#8c9494")
+        }
+        if quota.remainingPercent <= 10 {
+            return NSColor(hex: "#e35241")
+        }
+        if quota.remainingPercent <= 20 {
+            return NSColor(hex: "#d69a2d")
+        }
+        return NSColor(hex: "#9db8c8")
+    }
+
+    func drawQuotaText(_ text: String, in rect: NSRect, accent: NSColor, size: CGFloat, weight: NSFont.Weight) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: size, weight: weight),
+            .foregroundColor: accent.withAlphaComponent(0.95),
+            .paragraphStyle: paragraph
+        ]
+        (text as NSString).draw(in: rect, withAttributes: attributes)
     }
 
     func shouldBlink(for light: String) -> Bool {
@@ -431,7 +573,7 @@ final class TrafficLightView: NSView {
 
     func drawOpenFeedback() {
         guard hasOpenFeedback(), let light = openFeedbackLight else { return }
-        let imageRect = NSRect(x: 12, y: 5, width: 138, height: 378)
+        let imageRect = photoImageRect()
         let rect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -5, dy: -5)
         let progress = CGFloat(max(0, min(1, openFeedbackUntil.timeIntervalSinceNow / 0.7)))
         let alpha = 0.18 + 0.36 * progress
@@ -963,9 +1105,9 @@ final class TrafficLightView: NSView {
 
         let dx = mouseLocation.x - resizeStartMouse.x
         let dy = mouseLocation.y - resizeStartMouse.y
-        let scaleDelta = ((-dx / designWidth) + (-dy / designHeight)) / 2
+        let scaleDelta = ((-dx / currentDesignWidth()) + (-dy / currentDesignHeight())) / 2
         let nextScale = min(max(resizeStartScale + scaleDelta, minUIScale), maxUIScale)
-        let size = NSSize(width: designWidth * nextScale, height: designHeight * nextScale)
+        let size = NSSize(width: currentDesignWidth() * nextScale, height: currentDesignHeight() * nextScale)
         let origin = NSPoint(x: resizeStartFrame.maxX - size.width, y: resizeStartFrame.maxY - size.height)
         let clampedOrigin = clampedOriginForVisibleScreen(origin, size: size)
 
@@ -1004,6 +1146,11 @@ final class TrafficLightView: NSView {
         menu.addItem(.separator())
         addBlinkSettingsMenu(to: menu)
         menu.addItem(.separator())
+        let quotaItem = NSMenuItem(title: "显示 5H 额度", action: #selector(AppDelegate.toggleFiveHourQuota), keyEquivalent: "")
+        quotaItem.target = NSApp.delegate as? AppDelegate
+        quotaItem.state = fiveHourQuotaVisible() ? .on : .off
+        menu.addItem(quotaItem)
+        menu.addItem(.separator())
         menu.addItem(withTitle: "设置...", action: #selector(AppDelegate.showSettings), keyEquivalent: ",")
         menu.addItem(.separator())
         menu.addItem(withTitle: isMuted ? "取消静音" : "静音", action: #selector(AppDelegate.toggleMuteFromMenu), keyEquivalent: "")
@@ -1029,7 +1176,7 @@ final class TrafficLightView: NSView {
     func lampAtEvent(_ event: NSEvent) -> String? {
         let point = convert(event.locationInWindow, from: nil)
         let designPoint = designPoint(from: point)
-        let imageRect = NSRect(x: 12, y: 5, width: 138, height: 378)
+        let imageRect = photoImageRect()
         for light in ["red", "yellow", "green"] {
             let hitRect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -12, dy: -12)
             if hitRect.contains(designPoint) {
@@ -1162,7 +1309,11 @@ final class TrafficLightView: NSView {
     }
 
     func updateTooltip() {
-        toolTip = labels[state] ?? "空闲"
+        if fiveHourQuotaVisible(), let quota = latestFiveHourQuota() {
+            toolTip = "\(labels[state] ?? "空闲")\n\(quota.detailText)"
+        } else {
+            toolTip = labels[state] ?? "空闲"
+        }
     }
 }
 
@@ -1244,6 +1395,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if next != view.state || next == "waiting" {
             applyState(next, playPrompt: true, writeFile: false)
+        } else {
+            view.updateTooltip()
+            view.needsDisplay = true
         }
     }
 
@@ -1287,6 +1441,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func setWaiting() { setState("waiting") }
     @objc func setIdle() { setState("idle") }
     @objc func toggleMuteFromMenu() { toggleMute() }
+    @objc func toggleFiveHourQuota() {
+        updatePreference(fiveHourQuotaPreferenceKey, value: !fiveHourQuotaVisible())
+        resizeForCurrentPreferences()
+    }
     @objc func increaseScale() { applyScale(uiScale + 0.08) }
     @objc func decreaseScale() { applyScale(uiScale - 0.08) }
     @objc func resetScale() { applyScale(0.74) }
@@ -1347,6 +1505,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updatePreference("window_x", value: Double(origin.x))
         updatePreference("window_y", value: Double(origin.y))
         view.needsDisplay = true
+    }
+
+    func resizeForCurrentPreferences() {
+        guard let window, let view else { return }
+        let oldFrame = window.frame
+        let nextSize = currentWindowSize()
+        let origin = clampedOriginForVisibleScreen(
+            NSPoint(x: oldFrame.maxX - nextSize.width, y: oldFrame.maxY - nextSize.height),
+            size: nextSize
+        )
+        let nextFrame = NSRect(origin: origin, size: nextSize)
+        view.frame = NSRect(origin: .zero, size: nextSize)
+        window.setFrame(nextFrame, display: true, animate: false)
+        updatePreference("window_x", value: Double(nextFrame.origin.x))
+        updatePreference("window_y", value: Double(nextFrame.origin.y))
+        view.updateTooltip()
+        view.needsDisplay = true
+        settingsWindowController?.refresh()
     }
 
     func setState(_ state: String) {
@@ -1419,13 +1595,14 @@ final class SettingsWindowController: NSWindowController {
     let clickAckButton = NSButton(checkboxWithTitle: "点击会话后停止闪烁", target: nil, action: nil)
     let smartRedButton = NSButton(checkboxWithTitle: "红灯未处理自动加快", target: nil, action: nil)
     let muteButton = NSButton(checkboxWithTitle: "静音", target: nil, action: nil)
+    let fiveHourQuotaButton = NSButton(checkboxWithTitle: "显示 5H 额度", target: nil, action: nil)
     let doneMinutesField = NSTextField(string: "")
     let staleHoursField = NSTextField(string: "")
     let redEscalateField = NSTextField(string: "")
 
     init(appDelegate: AppDelegate) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 390, height: 330),
+            contentRect: NSRect(x: 0, y: 0, width: 390, height: 390),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -1447,7 +1624,7 @@ final class SettingsWindowController: NSWindowController {
         let width: CGFloat = 390
         let left: CGFloat = 24
         let fieldX: CGFloat = 236
-        var y: CGFloat = 282
+        var y: CGFloat = 342
 
         addLabel("大小", x: left, y: y, width: 80, to: contentView)
         scaleSlider.frame = NSRect(x: 86, y: y - 4, width: 190, height: 24)
@@ -1463,6 +1640,8 @@ final class SettingsWindowController: NSWindowController {
         configureCheckbox(smartRedButton, y: y, in: contentView, action: #selector(smartRedChanged(_:)))
         y -= 30
         configureCheckbox(muteButton, y: y, in: contentView, action: #selector(muteChanged(_:)))
+        y -= 30
+        configureCheckbox(fiveHourQuotaButton, y: y, in: contentView, action: #selector(fiveHourQuotaChanged(_:)))
 
         y -= 42
         addLabel("红灯加快阈值（秒）", x: left, y: y, width: 180, to: contentView)
@@ -1518,6 +1697,7 @@ final class SettingsWindowController: NSWindowController {
         clickAckButton.state = clickAcknowledgesSessions() ? .on : .off
         smartRedButton.state = (readBoolPreference("smart_red_blink") ?? true) ? .on : .off
         muteButton.state = (readBoolPreference("muted") ?? false) ? .on : .off
+        fiveHourQuotaButton.state = fiveHourQuotaVisible() ? .on : .off
         redEscalateField.stringValue = "\(Int(readDoublePreference("red_blink_escalate_after_seconds") ?? 30))"
         doneMinutesField.stringValue = String(format: "%.1f", doneAutoIdleInterval() / 60)
         staleHoursField.stringValue = String(format: "%.1f", sessionStaleInterval() / 3600)
@@ -1542,6 +1722,11 @@ final class SettingsWindowController: NSWindowController {
         if appDelegate?.soundController.muted != wantsMuted {
             appDelegate?.toggleMute()
         }
+    }
+
+    @objc func fiveHourQuotaChanged(_ sender: NSButton) {
+        updatePreference(fiveHourQuotaPreferenceKey, value: sender.state == .on)
+        appDelegate?.resizeForCurrentPreferences()
     }
 
     @objc func applyNumberSettings() {
@@ -1699,7 +1884,13 @@ func makeStatusSession(id: String, value: Any?) -> StatusSession? {
         sourceEvent: stringValue(session["source_event"]),
         toolName: stringValue(session["tool_name"]),
         model: stringValue(session["model"]),
-        transcriptPath: stringValue(session["transcript_path"])
+        transcriptPath: stringValue(session["transcript_path"]),
+        rateLimitPrimaryUsedPercent: optionalDoubleValue(session["rate_limit_primary_used_percent"]),
+        rateLimitPrimaryRemainingPercent: optionalDoubleValue(session["rate_limit_primary_remaining_percent"]),
+        rateLimitPrimaryResetsAt: optionalDoubleValue(session["rate_limit_primary_resets_at"]),
+        rateLimitPrimaryWindowMinutes: optionalDoubleValue(session["rate_limit_primary_window_minutes"]),
+        rateLimitName: stringValue(session["rate_limit_name"]),
+        rateLimitPlanType: stringValue(session["rate_limit_plan_type"])
     )
 }
 
@@ -1821,12 +2012,37 @@ func timeIntervalValue(_ value: Any?) -> TimeInterval {
     return 0
 }
 
+func optionalDoubleValue(_ value: Any?) -> Double? {
+    if let value = value as? Double {
+        return value
+    }
+    if let value = value as? Int {
+        return Double(value)
+    }
+    if let value = value as? String, let number = Double(value) {
+        return number
+    }
+    return nil
+}
+
 func stringValue(_ value: Any?) -> String? {
     guard let value else { return nil }
     if let string = value as? String {
         return string
     }
     return String(describing: value)
+}
+
+func latestFiveHourQuota() -> FiveHourQuota? {
+    var seen = Set<String>()
+    let sessions = attentionSessions() + activeSessions()
+    for session in sessions where !seen.contains(session.id) {
+        seen.insert(session.id)
+        if let quota = session.fiveHourQuota {
+            return quota
+        }
+    }
+    return nil
 }
 
 func latestSessionIsAcknowledged(for targetState: String) -> Bool {
