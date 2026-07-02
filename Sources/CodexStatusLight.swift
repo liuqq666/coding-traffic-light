@@ -21,7 +21,7 @@ let labels: [String: String] = [
 let stateOrder = ["working", "done", "waiting", "idle"]
 let baseDesignWidth: CGFloat = 162
 let baseDesignHeight: CGFloat = 384
-let fiveHourQuotaPanelWidth: CGFloat = 48
+let fiveHourQuotaPanelWidth: CGFloat = 30
 let fiveHourQuotaPreferenceKey = "five_hour_quota_visible"
 var uiScale: CGFloat = readCGFloatPreference("scale") ?? 0.74
 let minUIScale: CGFloat = 0.48
@@ -207,7 +207,7 @@ struct FiveHourQuota {
     }
 
     var detailText: String {
-        "5H 剩余 \(percentText)，\(resetTimeText) 重刷"
+        "5小时额度剩余 \(percentText)，\(resetTimeText) 重刷"
     }
 }
 
@@ -475,7 +475,7 @@ final class TrafficLightView: NSView {
     }
 
     func fiveHourQuotaPanelRect() -> NSRect {
-        NSRect(x: baseDesignWidth + 3, y: 18, width: fiveHourQuotaPanelWidth - 10, height: baseDesignHeight - 36)
+        NSRect(x: baseDesignWidth - 7, y: 18, width: 30, height: baseDesignHeight - 36)
     }
 
     func drawFiveHourQuotaPanel() {
@@ -503,7 +503,7 @@ final class TrafficLightView: NSView {
         inner.lineWidth = 0.8
         inner.stroke()
 
-        let track = NSRect(x: rect.midX - 4, y: rect.minY + 58, width: 8, height: rect.height - 116)
+        let track = NSRect(x: rect.midX - 4, y: rect.minY + 24, width: 8, height: rect.height - 66)
         NSColor.white.withAlphaComponent(0.10).setFill()
         NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
         if let quota {
@@ -516,13 +516,10 @@ final class TrafficLightView: NSView {
             NSBezierPath(ovalIn: NSRect(x: track.midX - 7, y: fill.maxY - 7, width: 14, height: 14)).fill()
         }
 
-        drawQuotaText("5H", in: NSRect(x: rect.minX + 3, y: rect.maxY - 29, width: rect.width - 6, height: 16), accent: accent, size: 11.5, weight: .semibold)
         if let quota {
-            drawQuotaText(quota.percentText, in: NSRect(x: rect.minX + 2, y: rect.midY - 9, width: rect.width - 4, height: 18), accent: accent, size: 10.5, weight: .medium)
-            drawQuotaText(quota.resetTimeText, in: NSRect(x: rect.minX + 2, y: rect.minY + 19, width: rect.width - 4, height: 14), accent: accent, size: 8.2, weight: .regular)
-            drawQuotaText("重刷", in: NSRect(x: rect.minX + 2, y: rect.minY + 6, width: rect.width - 4, height: 12), accent: NSColor(hex: "#8c9494"), size: 8.0, weight: .regular)
+            drawQuotaText(quota.percentText, in: NSRect(x: rect.minX + 2, y: track.maxY + 5, width: rect.width - 4, height: 16), accent: accent, size: 9.6, weight: .medium)
         } else {
-            drawQuotaText("等待", in: NSRect(x: rect.minX + 2, y: rect.midY - 9, width: rect.width - 4, height: 18), accent: accent, size: 9.0, weight: .regular)
+            drawQuotaText("--%", in: NSRect(x: rect.minX + 2, y: track.maxY + 5, width: rect.width - 4, height: 16), accent: accent, size: 9.0, weight: .regular)
         }
     }
 
@@ -1146,7 +1143,7 @@ final class TrafficLightView: NSView {
         menu.addItem(.separator())
         addBlinkSettingsMenu(to: menu)
         menu.addItem(.separator())
-        let quotaItem = NSMenuItem(title: "显示 5H 额度", action: #selector(AppDelegate.toggleFiveHourQuota), keyEquivalent: "")
+        let quotaItem = NSMenuItem(title: "显示额度条", action: #selector(AppDelegate.toggleFiveHourQuota), keyEquivalent: "")
         quotaItem.target = NSApp.delegate as? AppDelegate
         quotaItem.state = fiveHourQuotaVisible() ? .on : .off
         menu.addItem(quotaItem)
@@ -1595,7 +1592,7 @@ final class SettingsWindowController: NSWindowController {
     let clickAckButton = NSButton(checkboxWithTitle: "点击会话后停止闪烁", target: nil, action: nil)
     let smartRedButton = NSButton(checkboxWithTitle: "红灯未处理自动加快", target: nil, action: nil)
     let muteButton = NSButton(checkboxWithTitle: "静音", target: nil, action: nil)
-    let fiveHourQuotaButton = NSButton(checkboxWithTitle: "显示 5H 额度", target: nil, action: nil)
+    let fiveHourQuotaButton = NSButton(checkboxWithTitle: "显示额度条", target: nil, action: nil)
     let doneMinutesField = NSTextField(string: "")
     let staleHoursField = NSTextField(string: "")
     let redEscalateField = NSTextField(string: "")
