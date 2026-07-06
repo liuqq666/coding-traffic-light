@@ -21,7 +21,7 @@ let labels: [String: String] = [
 let stateOrder = ["working", "done", "waiting", "idle"]
 let baseDesignWidth: CGFloat = 162
 let baseDesignHeight: CGFloat = 384
-let fiveHourQuotaPanelWidth: CGFloat = 30
+let fiveHourQuotaPanelWidth: CGFloat = 12
 let fiveHourQuotaPreferenceKey = "five_hour_quota_visible"
 var uiScale: CGFloat = readCGFloatPreference("scale") ?? 0.74
 let minUIScale: CGFloat = 0.48
@@ -475,7 +475,7 @@ final class TrafficLightView: NSView {
     }
 
     func fiveHourQuotaPanelRect() -> NSRect {
-        NSRect(x: baseDesignWidth - 7, y: 18, width: 30, height: baseDesignHeight - 36)
+        NSRect(x: baseDesignWidth - 8, y: 24, width: 8, height: baseDesignHeight - 48)
     }
 
     func drawFiveHourQuotaPanel() {
@@ -484,67 +484,22 @@ final class TrafficLightView: NSView {
         let rect = fiveHourQuotaPanelRect()
         let quota = latestFiveHourQuota()
         let accent = quotaAccentColor(for: quota)
-        let panel = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
-
-        NSGraphicsContext.saveGraphicsState()
-        panel.addClip()
-        NSGradient(colors: [
-            NSColor(hex: "#171a19"),
-            NSColor(hex: "#050606")
-        ])?.draw(in: rect, angle: 0)
-        NSGraphicsContext.restoreGraphicsState()
-
-        NSColor.black.withAlphaComponent(0.82).setStroke()
-        panel.lineWidth = 1.2
-        panel.stroke()
-
-        NSColor.white.withAlphaComponent(0.08).setStroke()
-        let inner = NSBezierPath(roundedRect: rect.insetBy(dx: 1.4, dy: 1.4), xRadius: 4, yRadius: 4)
-        inner.lineWidth = 0.8
-        inner.stroke()
-
-        let track = NSRect(x: rect.midX - 4, y: rect.minY + 24, width: 8, height: rect.height - 66)
-        NSColor.white.withAlphaComponent(0.10).setFill()
-        NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
+        let track = NSRect(x: rect.midX - 1, y: rect.minY, width: 2, height: rect.height)
+        NSColor.white.withAlphaComponent(0.08).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 1, yRadius: 1).fill()
         if let quota {
-            let fillHeight = max(8, track.height * CGFloat(quota.remainingPercent / 100.0))
+            let fillHeight = max(3, track.height * CGFloat(quota.remainingPercent / 100.0))
             let fill = NSRect(x: track.minX, y: track.minY, width: track.width, height: fillHeight)
-            accent.withAlphaComponent(0.78).setFill()
-            NSBezierPath(roundedRect: fill, xRadius: 4, yRadius: 4).fill()
-
-            accent.withAlphaComponent(0.22).setFill()
-            NSBezierPath(ovalIn: NSRect(x: track.midX - 7, y: fill.maxY - 7, width: 14, height: 14)).fill()
-        }
-
-        if let quota {
-            drawQuotaText(quota.percentText, in: NSRect(x: rect.minX + 2, y: track.maxY + 5, width: rect.width - 4, height: 16), accent: accent, size: 9.6, weight: .medium)
-        } else {
-            drawQuotaText("--%", in: NSRect(x: rect.minX + 2, y: track.maxY + 5, width: rect.width - 4, height: 16), accent: accent, size: 9.0, weight: .regular)
+            accent.withAlphaComponent(0.88).setFill()
+            NSBezierPath(roundedRect: fill, xRadius: 1, yRadius: 1).fill()
         }
     }
 
     func quotaAccentColor(for quota: FiveHourQuota?) -> NSColor {
-        guard let quota else {
+        guard quota != nil else {
             return NSColor(hex: "#8c9494")
         }
-        if quota.remainingPercent <= 10 {
-            return NSColor(hex: "#e35241")
-        }
-        if quota.remainingPercent <= 20 {
-            return NSColor(hex: "#d69a2d")
-        }
-        return NSColor(hex: "#9db8c8")
-    }
-
-    func drawQuotaText(_ text: String, in rect: NSRect, accent: NSColor, size: CGFloat, weight: NSFont.Weight) {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: size, weight: weight),
-            .foregroundColor: accent.withAlphaComponent(0.95),
-            .paragraphStyle: paragraph
-        ]
-        (text as NSString).draw(in: rect, withAttributes: attributes)
+        return NSColor(hex: "#2fe078")
     }
 
     func shouldBlink(for light: String) -> Bool {
@@ -2031,6 +1986,11 @@ func stringValue(_ value: Any?) -> String? {
 }
 
 func latestFiveHourQuota() -> FiveHourQuota? {
+    let object = readStateObject()
+    if let quota = fiveHourQuota(from: object) {
+        return quota
+    }
+
     var seen = Set<String>()
     let sessions = attentionSessions() + activeSessions()
     for session in sessions where !seen.contains(session.id) {
@@ -2039,7 +1999,36 @@ func latestFiveHourQuota() -> FiveHourQuota? {
             return quota
         }
     }
+
+    if let rawSessions = object["sessions"] as? [String: Any] {
+        let allSessions = rawSessions.compactMap { makeStatusSession(id: $0.key, value: $0.value) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+        for session in allSessions where !seen.contains(session.id) {
+            seen.insert(session.id)
+            if let quota = session.fiveHourQuota {
+                return quota
+            }
+        }
+    }
     return nil
+}
+
+func fiveHourQuota(from object: [String: Any]) -> FiveHourQuota? {
+    guard let resetsAt = optionalDoubleValue(object["rate_limit_primary_resets_at"]) else {
+        return nil
+    }
+    let window = optionalDoubleValue(object["rate_limit_primary_window_minutes"]) ?? 300
+    guard window >= 295 && window <= 305 else { return nil }
+    let used = optionalDoubleValue(object["rate_limit_primary_used_percent"])
+    let remaining = optionalDoubleValue(object["rate_limit_primary_remaining_percent"]) ?? used.map { 100 - $0 }
+    guard let remaining else { return nil }
+    return FiveHourQuota(
+        remainingPercent: min(max(remaining, 0), 100),
+        usedPercent: min(max(used ?? 100 - remaining, 0), 100),
+        resetsAt: resetsAt,
+        limitName: stringValue(object["rate_limit_name"]),
+        planType: stringValue(object["rate_limit_plan_type"])
+    )
 }
 
 func latestSessionIsAcknowledged(for targetState: String) -> Bool {

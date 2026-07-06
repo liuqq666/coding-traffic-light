@@ -32,6 +32,8 @@ STATES = {"working", "done", "waiting", "idle"}
 COMMANDS = {"quit", "show", "reset-position", "clear-sessions", "settings"}
 DONE_TTL_SECONDS = 10 * 60
 SESSION_TTL_SECONDS = 6 * 60 * 60
+RATE_LIMIT_RECENT_FILE_LIMIT = 20
+RATE_LIMIT_RECENT_MAX_AGE_SECONDS = 12 * 60 * 60
 PRIORITY = {"waiting": 3, "working": 2, "done": 1, "idle": 0}
 SESSION_METADATA_KEYS = (
     "title",
@@ -195,16 +197,10 @@ def number_value(value: object) -> Optional[float]:
         return None
 
 
-def latest_rate_limit_metadata(transcript_path: object) -> dict:
-    if not isinstance(transcript_path, str) or not transcript_path:
-        return {}
-    path = Path(transcript_path)
-    if not path.exists() or not path.is_file():
-        return {}
-
-    latest = None
+def latest_token_count_payload(path: Path) -> Optional[dict]:
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            latest = None
             for line in handle:
                 if '"token_count"' not in line:
                     continue
@@ -216,11 +212,14 @@ def latest_rate_limit_metadata(transcript_path: object) -> dict:
                 if isinstance(payload, dict) and payload.get("type") == "token_count":
                     latest = payload
     except Exception:
-        return {}
+        return None
+    return latest if isinstance(latest, dict) else None
 
-    if not isinstance(latest, dict):
+
+def rate_limit_metadata_from_token_count(payload: dict) -> dict:
+    if not isinstance(payload, dict):
         return {}
-    rate_limits = latest.get("rate_limits")
+    rate_limits = payload.get("rate_limits")
     if not isinstance(rate_limits, dict):
         return {}
     primary = rate_limits.get("primary")
@@ -251,6 +250,83 @@ def latest_rate_limit_metadata(transcript_path: object) -> dict:
     return metadata
 
 
+def latest_rate_limit_metadata_from_path(path: Path) -> dict:
+    if not path.exists() or not path.is_file():
+        return {}
+    payload = latest_token_count_payload(path)
+    if not payload:
+        return {}
+    return rate_limit_metadata_from_token_count(payload)
+
+
+def recent_transcript_paths(preferred_path: object) -> list[Path]:
+    paths: list[tuple[float, Path]] = []
+    seen: set[str] = set()
+
+    def add_path(path: Path) -> None:
+        try:
+            resolved = str(path.expanduser().resolve())
+            stat = path.stat()
+        except Exception:
+            return
+        if resolved in seen or not path.is_file():
+            return
+        seen.add(resolved)
+        paths.append((stat.st_mtime, path))
+
+    if isinstance(preferred_path, str) and preferred_path:
+        add_path(Path(preferred_path))
+
+    if CODEX_SESSIONS_DIR.exists():
+        cutoff = time.time() - RATE_LIMIT_RECENT_MAX_AGE_SECONDS
+        try:
+            for path in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        continue
+                except Exception:
+                    continue
+                add_path(path)
+        except Exception:
+            pass
+
+    paths.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in paths[:RATE_LIMIT_RECENT_FILE_LIMIT]]
+
+
+def active_five_hour_quota(metadata: dict) -> bool:
+    window = number_value(metadata.get("rate_limit_primary_window_minutes"))
+    resets_at = number_value(metadata.get("rate_limit_primary_resets_at"))
+    if window is None or resets_at is None:
+        return False
+    return 295 <= window <= 305 and resets_at > time.time()
+
+
+def best_rate_limit_metadata(candidates: list[dict]) -> dict:
+    usable = [metadata for metadata in candidates if metadata]
+    if not usable:
+        return {}
+    active = [metadata for metadata in usable if active_five_hour_quota(metadata)]
+    pool = active or usable
+
+    def score(metadata: dict) -> tuple[float, float, float]:
+        remaining = number_value(metadata.get("rate_limit_primary_remaining_percent"))
+        used = number_value(metadata.get("rate_limit_primary_used_percent"))
+        resets_at = number_value(metadata.get("rate_limit_primary_resets_at"))
+        return (
+            remaining if remaining is not None else 101.0,
+            -(used if used is not None else -1.0),
+            -(resets_at if resets_at is not None else 0.0),
+        )
+
+    return min(pool, key=score)
+
+
+def latest_rate_limit_metadata(transcript_path: object) -> dict:
+    candidates = [latest_rate_limit_metadata_from_path(path) for path in recent_transcript_paths(transcript_path)]
+    return best_rate_limit_metadata(candidates)
+
+
 def metadata_from_args(args: argparse.Namespace) -> dict:
     metadata = {}
     for key in SESSION_METADATA_KEYS:
@@ -261,11 +337,36 @@ def metadata_from_args(args: argparse.Namespace) -> dict:
     return metadata
 
 
+def apply_rate_limit_metadata(payload: dict, metadata: Optional[dict]) -> None:
+    if not metadata:
+        return
+    rate_limit_keys = [
+        "rate_limit_primary_used_percent",
+        "rate_limit_primary_remaining_percent",
+        "rate_limit_primary_window_minutes",
+        "rate_limit_primary_resets_at",
+        "rate_limit_name",
+        "rate_limit_plan_type",
+    ]
+    changed = False
+    has_primary_rate_limit = any(key in metadata for key in rate_limit_keys[:4])
+    for key in rate_limit_keys:
+        if key in metadata:
+            payload[key] = metadata[key]
+            changed = True
+        elif has_primary_rate_limit and key in {"rate_limit_name", "rate_limit_plan_type"} and key in payload:
+            payload.pop(key, None)
+            changed = True
+    if changed:
+        payload["rate_limit_updated_at"] = time.time()
+
+
 def write_state(state: str, session_id: Optional[str] = None, metadata: Optional[dict] = None) -> None:
     if state not in STATES:
         raise SystemExit(f"Unknown state: {state}")
     payload = read_payload()
     now = time.time()
+    apply_rate_limit_metadata(payload, metadata)
 
     if session_id:
         sessions = payload.get("sessions")
