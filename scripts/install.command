@@ -24,8 +24,10 @@ chmod +x "$PWD/bin/codex-light" "$PWD/bin/codex-light-run" "$PWD/bin/codex-light
 
 ./scripts/install-autostart.command
 ./scripts/install-codex-hooks.command
+./scripts/start.command
 
 echo "Installed Codex Status Light."
 echo "Binary: $SUPPORT_DIR/CodexStatusLight"
 echo "Commands: $BIN_DIR/codex-light, $BIN_DIR/codex-light-run, $BIN_DIR/codex-light-hook"
-echo "Next: open Codex and run /hooks once to trust the status-light hooks."
+echo "Quick start: double-click start.command or run $BIN_DIR/codex-light show"
+echo "Codex startup: hooks will start the light on Codex activity after you trust them once with /hooks."

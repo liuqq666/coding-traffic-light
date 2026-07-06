@@ -25,7 +25,7 @@
 
 ### 一键安装配置
 
-把下面这一行复制给 Codex 执行，它会自动下载安装到 `~/.codex/codex-status-light`，并完成编译、开机自启、命令安装和 Codex hooks 配置：
+把下面这一行复制给 Codex 或终端执行，它会自动下载安装到 `~/.codex/codex-status-light`，并完成编译、立即启动、开机自启、命令安装和 Codex hooks 配置：
 
 ```bash
 /bin/zsh -lc 'set -e; d="$HOME/.codex/codex-status-light"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/liuqq666/coding-traffic-light.git "$d"; fi; cd "$d"; ./install.command'
@@ -50,6 +50,7 @@ install.command
 它会自动完成：
 
 - 编译并安装悬浮灯。
+- 立即启动并显示悬浮灯。
 - 设置开机自动启动。
 - 安装 `codex-light` / `codex-light-run` / `codex-light-hook` 命令。
 - 把 Codex hooks 写入 `~/.codex/config.toml`。
@@ -71,12 +72,33 @@ export PATH="$HOME/.codex/bin:$PATH"
 
 ## 打开
 
-安装后会自动启动悬浮灯。也可以手动运行：
+安装后会自动启动悬浮灯。之后快速启动可以双击根目录里的：
+
+```text
+start.command
+```
+
+或运行：
+
+```bash
+codex-light show
+```
+
+如果 launch agent 被停掉，也可以强制拉起：
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.liuqq666.codex-status-light"
 codex-light show
 ```
+
+### 和 Codex 一起启动
+
+安装脚本会配置两层自动启动：
+
+- macOS 登录时通过 LaunchAgent 自动启动。
+- Codex hooks 被信任后，Codex 的第一次会话活动会自动拉起状态灯；如果状态灯已退出，后续 Codex 事件也会再次拉起。
+
+首次使用 hooks 时仍需要在 Codex 里运行一次 `/hooks` 并确认信任。这是 Codex 对本地 command hooks 的安全确认，项目脚本不会绕过。
 
 ## 命令行控制
 
