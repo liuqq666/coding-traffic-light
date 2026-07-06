@@ -2,6 +2,8 @@
 
 一个 macOS 桌面悬浮状态灯，用来显示 Codex 当前工作状态。
 
+![Codex Status Light 预览](docs/status-light-preview.png)
+
 ## 状态
 
 - 黄灯：Codex 正在干活。
