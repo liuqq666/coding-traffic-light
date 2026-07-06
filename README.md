@@ -4,6 +4,16 @@
 
 ![Codex Status Light 预览](docs/status-light-preview.png)
 
+## 一键安装
+
+把下面这一行复制给 Codex 或终端执行，它会自动下载安装到 `~/.codex/codex-status-light`，并完成编译、立即启动、开机自启、命令安装和 Codex hooks 配置：
+
+```bash
+/bin/zsh -lc 'set -e; d="$HOME/.codex/codex-status-light"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/liuqq666/coding-traffic-light.git "$d"; fi; cd "$d"; ./install.command'
+```
+
+首次使用 hooks 时，Codex 会要求你信任一次。出现提示时，在 Codex 里运行 `/hooks`，按提示确认即可。
+
 ## 状态
 
 - 黄灯：Codex 正在干活。
@@ -23,25 +33,7 @@
 ~/Library/Application Support/CodexStatusLight/preferences.json
 ```
 
-## 安装
-
-### 一键安装配置
-
-把下面这一行复制给 Codex 或终端执行，它会自动下载安装到 `~/.codex/codex-status-light`，并完成编译、立即启动、开机自启、命令安装和 Codex hooks 配置：
-
-```bash
-/bin/zsh -lc 'set -e; d="$HOME/.codex/codex-status-light"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/liuqq666/coding-traffic-light.git "$d"; fi; cd "$d"; ./install.command'
-```
-
-首次使用 hooks 时，Codex 会要求你信任一次。出现提示时，在 Codex 里运行：
-
-```text
-/hooks
-```
-
-按提示确认即可。这个信任步骤是 Codex 对非托管 command hooks 的安全确认，普通安装脚本不会替你绕过；hooks 新增或变化后也需要重新确认。
-
-### 手动安装
+## 手动安装
 
 下载后双击根目录里的：
 
