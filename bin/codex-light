@@ -222,6 +222,8 @@ def recent_transcript_paths(preferred_path: object) -> list[Path]:
         cutoff = time.time() - RATE_LIMIT_RECENT_MAX_AGE_SECONDS
         try:
             for path in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
+                if path.name.startswith(("rollout-test-", "rollout-ui-", "rollout-ui-test-")):
+                    continue
                 try:
                     if path.stat().st_mtime < cutoff:
                         continue
