@@ -2,7 +2,9 @@
 set -e
 
 cd "$(dirname "$0")/.."
+if grep -q "doneAutoIdleInterval" Sources/CodexStatusLight.swift; then
+  patch -p0 < scripts/status-rules.patch
+fi
 mkdir -p build
-cp Sources/CodexStatusLight.swift build/CodexStatusLight.generated.swift
-swiftc -framework Cocoa build/CodexStatusLight.generated.swift -o build/CodexStatusLight
+swiftc -framework Cocoa Sources/CodexStatusLight.swift -o build/CodexStatusLight
 echo "Built build/CodexStatusLight"
