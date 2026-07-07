@@ -26,7 +26,17 @@ STATES = {"working", "done", "waiting", "idle"}
 COMMANDS = {"quit", "show", "reset-position", "clear-sessions", "settings"}
 PRIORITY = {"waiting": 3, "done": 2, "working": 1, "idle": 0}
 DEFAULT_SESSION_STALE_SECONDS = 6 * 60 * 60
+RATE_LIMIT_RECENT_FILE_LIMIT = 20
+RATE_LIMIT_RECENT_MAX_AGE_SECONDS = 12 * 60 * 60
 METADATA_KEYS = ("title", "cwd", "preview", "source_event", "tool_name", "turn_id", "transcript_path", "model")
+RATE_LIMIT_KEYS = (
+    "rate_limit_primary_used_percent",
+    "rate_limit_primary_remaining_percent",
+    "rate_limit_primary_window_minutes",
+    "rate_limit_primary_resets_at",
+    "rate_limit_name",
+    "rate_limit_plan_type",
+)
 
 
 def ensure_runtime() -> None:
@@ -121,13 +131,166 @@ def compact(value: object, limit: int = 300) -> str | None:
     return text[: limit - 1] + "…" if len(text) > limit else text
 
 
+def number(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def latest_token_count_payload(path: Path) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            latest = None
+            for line in handle:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                payload = event.get("payload")
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    latest = payload
+    except Exception:
+        return None
+    return latest if isinstance(latest, dict) else None
+
+
+def quota_metadata_from_token_count(payload: dict) -> dict:
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        return {}
+    primary = rate_limits.get("primary")
+    if not isinstance(primary, dict):
+        return {}
+
+    out = {}
+    used = number(primary.get("used_percent"))
+    if used is not None:
+        used = min(max(used, 0.0), 100.0)
+        out["rate_limit_primary_used_percent"] = used
+        out["rate_limit_primary_remaining_percent"] = min(max(100.0 - used, 0.0), 100.0)
+
+    window = number(primary.get("window_minutes"))
+    if window is not None:
+        out["rate_limit_primary_window_minutes"] = window
+
+    resets_at = number(primary.get("resets_at"))
+    if resets_at is not None:
+        out["rate_limit_primary_resets_at"] = resets_at
+
+    limit_name = compact(rate_limits.get("limit_name"), 120)
+    if limit_name:
+        out["rate_limit_name"] = limit_name
+    plan_type = compact(rate_limits.get("plan_type"), 40)
+    if plan_type:
+        out["rate_limit_plan_type"] = plan_type
+    return out
+
+
+def quota_metadata_from_path(path: Path) -> dict:
+    if not path.exists() or not path.is_file():
+        return {}
+    payload = latest_token_count_payload(path)
+    if not payload:
+        return {}
+    return quota_metadata_from_token_count(payload)
+
+
+def recent_transcript_paths(preferred_path: object) -> list[Path]:
+    paths: list[tuple[float, Path]] = []
+    seen: set[str] = set()
+
+    def add_path(path: Path) -> None:
+        try:
+            resolved = str(path.expanduser().resolve())
+            stat = path.stat()
+        except Exception:
+            return
+        if resolved in seen or not path.is_file():
+            return
+        seen.add(resolved)
+        paths.append((stat.st_mtime, path))
+
+    if isinstance(preferred_path, str) and preferred_path:
+        add_path(Path(preferred_path))
+
+    if CODEX_SESSIONS_DIR.exists():
+        cutoff = time.time() - RATE_LIMIT_RECENT_MAX_AGE_SECONDS
+        try:
+            for path in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        continue
+                except Exception:
+                    continue
+                add_path(path)
+        except Exception:
+            pass
+
+    paths.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in paths[:RATE_LIMIT_RECENT_FILE_LIMIT]]
+
+
+def active_five_hour_quota(meta: dict) -> bool:
+    resets_at = number(meta.get("rate_limit_primary_resets_at"))
+    if resets_at is None or resets_at <= time.time():
+        return False
+    window = number(meta.get("rate_limit_primary_window_minutes"))
+    return window is None or 295 <= window <= 305
+
+
+def best_quota_metadata(candidates: list[dict]) -> dict:
+    usable = [candidate for candidate in candidates if candidate]
+    if not usable:
+        return {}
+    active = [candidate for candidate in usable if active_five_hour_quota(candidate)]
+    pool = active or usable
+
+    def score(meta: dict) -> tuple[float, float, float]:
+        remaining = number(meta.get("rate_limit_primary_remaining_percent"))
+        used = number(meta.get("rate_limit_primary_used_percent"))
+        resets_at = number(meta.get("rate_limit_primary_resets_at"))
+        return (
+            remaining if remaining is not None else 101.0,
+            -(used if used is not None else -1.0),
+            -(resets_at if resets_at is not None else 0.0),
+        )
+
+    return min(pool, key=score)
+
+
+def latest_quota_metadata(transcript_path: object) -> dict:
+    candidates = [quota_metadata_from_path(path) for path in recent_transcript_paths(transcript_path)]
+    return best_quota_metadata(candidates)
+
+
 def metadata(args: argparse.Namespace) -> dict:
     out = {}
     for key in METADATA_KEYS:
         value = compact(getattr(args, key, None), 300 if key in {"cwd", "transcript_path"} else 180)
         if value:
             out[key] = value
+    out.update(latest_quota_metadata(getattr(args, "transcript_path", None)))
     return out
+
+
+def apply_quota_metadata(payload: dict, meta: dict) -> None:
+    if not any(key in meta for key in RATE_LIMIT_KEYS[:4]):
+        return
+    changed = False
+    for key in RATE_LIMIT_KEYS:
+        if key in meta:
+            payload[key] = meta[key]
+            changed = True
+        elif key in {"rate_limit_name", "rate_limit_plan_type"} and key in payload:
+            payload.pop(key, None)
+            changed = True
+    if changed:
+        payload["rate_limit_updated_at"] = time.time()
 
 
 def candidate_state(now: float, session_id: str, item: object) -> str | None:
@@ -169,6 +332,7 @@ def write_state(state: str, session_id: str | None, meta: dict) -> None:
         raise SystemExit(f"Unknown state: {state}")
     payload = read_json(STATE_FILE)
     now = time.time()
+    apply_quota_metadata(payload, meta)
     if session_id:
         payload.pop("manual_state", None)
         sessions = payload.get("sessions")

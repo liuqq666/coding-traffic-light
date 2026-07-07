@@ -382,18 +382,25 @@ final class TrafficLightView: NSView {
 
     func visibleLights() -> [String] {
         var lights: [String] = []
-        for light in ["red", "yellow", "green"] where lightNeedsAttention(light) {
-            lights.append(light)
+        if !attentionSessions(for: "waiting").isEmpty {
+            lights.append("red")
         }
-        if lights.isEmpty, readStateObject()["manual_state"] != nil {
-            switch state {
-            case "waiting": return ["red"]
-            case "working": return ["yellow"]
-            case "done": return ["green"]
-            default: return []
-            }
+        if !activeSessions(for: "working").isEmpty {
+            lights.append("yellow")
         }
-        return lights
+        if !attentionSessions(for: "done").isEmpty {
+            lights.append("green")
+        }
+        if !lights.isEmpty {
+            return lights
+        }
+
+        switch state {
+        case "waiting": return ["red"]
+        case "working": return ["yellow"]
+        case "done": return ["green"]
+        default: return []
+        }
     }
 
     func isLightVisible(_ light: String) -> Bool {
@@ -503,11 +510,7 @@ final class TrafficLightView: NSView {
     }
 
     func lightNeedsAttention(_ light: String) -> Bool {
-        let state = stateName(for: light)
-        if state == "working" {
-            return !activeSessions(for: state).isEmpty
-        }
-        return !attentionSessions(for: state).isEmpty
+        !attentionSessions(for: stateName(for: light)).isEmpty
     }
 
     func hasOpenFeedback() -> Bool {
