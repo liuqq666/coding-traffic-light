@@ -26,7 +26,6 @@ let fiveHourQuotaPreferenceKey = "five_hour_quota_visible"
 var uiScale: CGFloat = readCGFloatPreference("scale") ?? 0.74
 let minUIScale: CGFloat = 0.48
 let maxUIScale: CGFloat = 1.35
-let defaultDoneAutoIdleSeconds: TimeInterval = 10 * 60
 let defaultSessionStaleSeconds: TimeInterval = 6 * 60 * 60
 let realTrafficLightAssetPrefix = "traffic-light-real"
 
@@ -89,10 +88,6 @@ func effectiveBlinkFrequency(for light: String) -> CGFloat {
     guard age >= threshold else { return blinkFrequency(for: light) }
     let fastFrequency = readDoublePreference("red_blink_fast_frequency") ?? 2.6
     return max(blinkFrequency(for: light), CGFloat(fastFrequency))
-}
-
-func doneAutoIdleInterval() -> TimeInterval {
-    max(10, readDoublePreference("done_auto_idle_seconds") ?? defaultDoneAutoIdleSeconds)
 }
 
 func sessionStaleInterval() -> TimeInterval {
@@ -508,7 +503,11 @@ final class TrafficLightView: NSView {
     }
 
     func lightNeedsAttention(_ light: String) -> Bool {
-        !attentionSessions(for: stateName(for: light)).isEmpty
+        let state = stateName(for: light)
+        if state == "working" {
+            return !activeSessions(for: state).isEmpty
+        }
+        return !attentionSessions(for: state).isEmpty
     }
 
     func hasOpenFeedback() -> Bool {
@@ -1113,7 +1112,7 @@ final class TrafficLightView: NSView {
     func openClickedLampSession(with event: NSEvent) -> Bool {
         guard let light = lampAtEvent(event) else { return false }
         let targetState = stateName(for: light)
-        guard let session = latestAttentionSession(for: targetState) else {
+        guard let session = latestAttentionSession(for: targetState) ?? latestSession(for: targetState) else {
             NSSound.beep()
             return true
         }
@@ -1273,8 +1272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var view: TrafficLightView!
     var lastModified = Date.distantPast
+    var lastForcedRecompute = Date.distantPast
     var waitingBlinkStopTimer: Timer?
-    var doneAutoIdleTimer: Timer?
     var settingsWindowController: SettingsWindowController?
     let soundController = SoundController()
 
@@ -1334,8 +1333,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func pollState() {
         let attrs = try? FileManager.default.attributesOfItem(atPath: stateFile.path)
         let modified = attrs?[.modificationDate] as? Date ?? Date.distantPast
-        guard modified != lastModified else { return }
-        lastModified = modified
+        let now = Date()
+        let fileChanged = modified != lastModified
+        let shouldForceRecompute = now.timeIntervalSince(lastForcedRecompute) >= 1.0
+        guard fileChanged || shouldForceRecompute else { return }
+        if fileChanged {
+            lastModified = modified
+            codexThreadOpenabilityCache.removeAll()
+        }
+        if shouldForceRecompute {
+            lastForcedRecompute = now
+        }
         if let command = readCommand() {
             applyCommand(command)
         }
@@ -1493,11 +1501,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             stopWaitingBlinkTimer()
         }
-        if state == "done" {
-            startDoneAutoIdleTimer()
-        } else {
-            stopDoneAutoIdleTimer()
-        }
         view.isMuted = soundController.muted
         view.needsDisplay = true
         soundController.apply(state: state, playPrompt: playPrompt)
@@ -1514,19 +1517,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         waitingBlinkStopTimer?.invalidate()
         waitingBlinkStopTimer = nil
         view.waitingAlertActive = false
-    }
-
-    func startDoneAutoIdleTimer() {
-        doneAutoIdleTimer?.invalidate()
-        doneAutoIdleTimer = Timer.scheduledTimer(withTimeInterval: doneAutoIdleInterval(), repeats: false) { [weak self] _ in
-            guard let self, self.view.state == "done" else { return }
-            self.applyState("idle", playPrompt: false, writeFile: true)
-        }
-    }
-
-    func stopDoneAutoIdleTimer() {
-        doneAutoIdleTimer?.invalidate()
-        doneAutoIdleTimer = nil
     }
 
     func toggleMute() {
@@ -1548,7 +1538,6 @@ final class SettingsWindowController: NSWindowController {
     let smartRedButton = NSButton(checkboxWithTitle: "红灯未处理自动加快", target: nil, action: nil)
     let muteButton = NSButton(checkboxWithTitle: "静音", target: nil, action: nil)
     let fiveHourQuotaButton = NSButton(checkboxWithTitle: "显示额度条", target: nil, action: nil)
-    let doneMinutesField = NSTextField(string: "")
     let staleHoursField = NSTextField(string: "")
     let redEscalateField = NSTextField(string: "")
 
@@ -1599,9 +1588,6 @@ final class SettingsWindowController: NSWindowController {
         addLabel("红灯加快阈值（秒）", x: left, y: y, width: 180, to: contentView)
         configureField(redEscalateField, x: fieldX, y: y, in: contentView)
         y -= 34
-        addLabel("绿灯自动变暗（分钟）", x: left, y: y, width: 190, to: contentView)
-        configureField(doneMinutesField, x: fieldX, y: y, in: contentView)
-        y -= 34
         addLabel("会话过期（小时）", x: left, y: y, width: 180, to: contentView)
         configureField(staleHoursField, x: fieldX, y: y, in: contentView)
 
@@ -1651,7 +1637,6 @@ final class SettingsWindowController: NSWindowController {
         muteButton.state = (readBoolPreference("muted") ?? false) ? .on : .off
         fiveHourQuotaButton.state = fiveHourQuotaVisible() ? .on : .off
         redEscalateField.stringValue = "\(Int(readDoublePreference("red_blink_escalate_after_seconds") ?? 30))"
-        doneMinutesField.stringValue = String(format: "%.1f", doneAutoIdleInterval() / 60)
         staleHoursField.stringValue = String(format: "%.1f", sessionStaleInterval() / 3600)
     }
 
@@ -1683,14 +1668,9 @@ final class SettingsWindowController: NSWindowController {
 
     @objc func applyNumberSettings() {
         let redSeconds = max(5, redEscalateField.doubleValue)
-        let doneSeconds = max(0.5, doneMinutesField.doubleValue) * 60
         let staleSeconds = max(0.25, staleHoursField.doubleValue) * 3600
         updatePreference("red_blink_escalate_after_seconds", value: redSeconds)
-        updatePreference("done_auto_idle_seconds", value: doneSeconds)
         updatePreference("session_stale_seconds", value: staleSeconds)
-        if appDelegate?.view.state == "done" {
-            appDelegate?.startDoneAutoIdleTimer()
-        }
         appDelegate?.view.needsDisplay = true
         refresh()
     }
@@ -1745,7 +1725,7 @@ func readState() -> String {
     }
 
     if sessions != nil {
-        for session in attentionSessions() {
+        for session in aggregateCandidateSessions() {
             if let priority = statePriority(session.state) {
                 candidates.append((session.state, priority))
             }
@@ -1758,8 +1738,8 @@ func readState() -> String {
 func statePriority(_ state: String) -> Int? {
     switch state {
     case "waiting": return 3
-    case "working": return 2
-    case "done": return 1
+    case "done": return 2
+    case "working": return 1
     case "idle": return 0
     default: return nil
     }
@@ -1819,6 +1799,15 @@ func attentionSessions(for targetState: String? = nil) -> [StatusSession] {
     activeSessions(for: targetState).filter { !$0.isAcknowledged }
 }
 
+func aggregateCandidateSessions() -> [StatusSession] {
+    activeSessions().filter { session in
+        if session.state == "working" {
+            return true
+        }
+        return !session.isAcknowledged
+    }
+}
+
 func makeStatusSession(id: String, value: Any?) -> StatusSession? {
     guard let session = value as? [String: Any],
           let state = session["state"] as? String,
@@ -1851,10 +1840,7 @@ func sessionIsFresh(_ session: StatusSession) -> Bool {
         return false
     }
     let age = Date().timeIntervalSince1970 - session.updatedAt
-    if session.state == "done" && age > doneAutoIdleInterval() {
-        return false
-    }
-    if (session.state == "working" || session.state == "waiting") && age > sessionStaleInterval() {
+    if session.state == "working" && age > sessionStaleInterval() {
         return false
     }
     return true
@@ -1862,11 +1848,14 @@ func sessionIsFresh(_ session: StatusSession) -> Bool {
 
 func sessionIsOpenable(_ session: StatusSession) -> Bool {
     guard isUUIDString(session.id) else {
-        return true
+        return false
     }
     let now = Date().timeIntervalSince1970
-    if let cached = codexThreadOpenabilityCache[session.id], now - cached.checkedAt < 5 {
-        return cached.openable
+    if let cached = codexThreadOpenabilityCache[session.id] {
+        let ttl: TimeInterval = cached.openable ? 5.0 : 0.75
+        if now - cached.checkedAt < ttl {
+            return cached.openable
+        }
     }
 
     let openable = queryCodexThreadOpenability(session)

@@ -170,6 +170,7 @@ def write_state(state: str, session_id: str | None, meta: dict) -> None:
     payload = read_json(STATE_FILE)
     now = time.time()
     if session_id:
+        payload.pop("manual_state", None)
         sessions = payload.get("sessions")
         sessions = sessions if isinstance(sessions, dict) else {}
         if state == "idle":

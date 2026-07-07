@@ -13,7 +13,6 @@ exec "$PYTHON" "$0" "$@"
 ':'''
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -69,6 +68,9 @@ def ensure_status_light_running() -> None:
             return
     except Exception as exc:
         log(f"ensure-running launchctl-failed {exc}")
+
+    if status_light_running():
+        return
 
     if LIGHT_APP.exists() and os.access(LIGHT_APP, os.X_OK):
         try:
@@ -169,24 +171,6 @@ def set_light(state: str, event: dict) -> None:
         log(f"set-failed {state} {exc}")
 
 
-def looks_waiting(message: str) -> bool:
-    if not message:
-        return False
-    patterns = [
-        r"等你",
-        r"需要你",
-        r"需要.*?(回复|确认|授权|登录|验证码|文件|截图|选择|提供|补充)",
-        r"请.*?(回复|确认|授权|登录|提供|发我|补充|选择)",
-        r"你.*?(确认|选择|提供|发我|补充).*?吗",
-        r"要不要|可以吗|行不行|是否",
-        r"我需要.*?(你|确认|授权|文件|截图|验证码)",
-        r"blocked|waiting for user|permission|approval",
-        r"\?",
-        r"？",
-    ]
-    return any(re.search(pattern, message, re.IGNORECASE | re.DOTALL) for pattern in patterns)
-
-
 event = read_event()
 name = event.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "")
 log(f"event {name} session={session_id(event)} keys={','.join(sorted(event.keys()))}")
@@ -197,10 +181,6 @@ if name in {"UserPromptSubmit", "PreToolUse"}:
 elif name == "PermissionRequest":
     set_light("waiting", event)
 elif name in {"Stop", "SubagentStop"}:
-    message = event.get("last_assistant_message") or ""
-    if looks_waiting(message):
-        set_light("waiting", event)
-    else:
-        set_light("done", event)
+    set_light("done", event)
 
 print("{}")
