@@ -16,9 +16,10 @@
 
 ## 状态
 
-- 黄灯：Codex 正在干活。
-- 绿灯：任务完成，可以验收；默认 10 分钟后自动变暗。
-- 红灯：正在等你回复、确认、授权或补文件；默认闪烁，未处理一段时间后自动加快。
+- 黄灯：存在活跃 working 会话，表示 Codex 正在工作；working 会话即使已点击查看，也会保持黄灯，直到会话 done/idle 或超过会话过期时间。
+- 绿灯：存在未查看 done 会话，表示有结果待验收；绿灯不会 10 分钟自动变暗，会一直保持到你点击打开/标记已查看，或会话被清理、归档、不可打开。
+- 红灯：存在未查看 waiting 会话，表示真正等待用户动作；waiting 不按时间自动过期，只按已查看、可打开、归档状态过滤。
+- 多个状态可以同时存在，对应的红、黄、绿灯可以同时亮。
 - 全暗：空闲。
 
 状态文件：
@@ -109,6 +110,8 @@ codex-light reset-position
 codex-light clear-sessions
 ```
 
+不带 `--session` 的 `working` / `done` / `waiting` / `idle` 是手动全局状态，会清空旧 sessions，避免旧会话继续影响聚合。
+
 如果悬浮灯没有出现在屏幕上，先试：
 
 ```bash
@@ -136,9 +139,9 @@ codex-light-run python3 script.py
 
 规则：
 
-- `UserPromptSubmit` / `PreToolUse`：黄灯。
-- `PermissionRequest`：红灯。
-- `Stop` / `SubagentStop`：绿灯；如果最后回复像是在等待用户，则保持红灯。
+- `UserPromptSubmit` / `PreToolUse`：黄灯，记录 working。
+- `PermissionRequest`：红灯，记录 waiting。
+- `Stop` / `SubagentStop`：绿灯，一律记录 done；不会再根据最后回复文本猜测 waiting。
 - hooks 会记录会话 id、工作目录、事件来源、工具名和一段摘要，用于右键会话菜单。
 - hooks 会在更新状态前自动确认状态灯进程已启动。
 - 如果 transcript 里已有 `token_count`，会记录 5 小时额度余量和重刷时间。
@@ -146,19 +149,21 @@ codex-light-run python3 script.py
 多会话按独立会话管理：
 
 - 每个 Codex 会话按 `session_id` 单独记录 `state`、`updated_at`、`acknowledged_at` 和摘要信息。
-- 只管理非归档、未过期、可打开的会话；已归档会话会被过滤，避免点击后 Codex 卡在 loading。
-- 未查看的 waiting 会话点亮红灯。
-- 未查看的 working 会话点亮黄灯。
-- 未查看的 done 会话点亮绿灯。
+- 只管理非归档、可打开的 UUID 会话；非 UUID fallback/test session 不会抢状态或抢点击。
+- working 会话按 `session_stale_seconds` 过滤，默认 6 小时。
+- done / waiting 不按 TTL 自动过期。
+- 未查看 waiting 会话点亮红灯。
+- 活跃 working 会话点亮黄灯，即使已查看也会继续亮。
+- 未查看 done 会话点亮绿灯。
 - 多个状态同时存在时，对应的多个灯会同时亮。
-- 打开某条会话后会写入 `acknowledged_at`，这条会话不再点亮对应灯；后续该会话有新事件时会重新点亮。
-- 如果所有会话都已查看或已过期，状态灯变暗。
+- 打开 done / waiting 会话后会写入 `acknowledged_at`，这条会话不再点亮待处理灯；working 会话打开后仍可保持黄灯。
+- 单值状态仍保留在 `state.json` 和 `codex-light status` 里，用于 tooltip、声音和兜底，优先级为 waiting > done > working > idle。
 
 ## 交互
 
-- 单击某个灯面：打开该颜色对应状态的最新未查看 Codex 会话。
+- 单击某个灯面：优先打开该颜色对应状态下最新未查看 Codex 会话；没有未查看会话时，fallback 到该状态下最新活跃会话。
 - 右键某个灯面：列出该状态下所有非归档活跃会话，可以选择打开或全部标记已查看。
-- 点击打开会话后，会把这条会话标记为已查看，该条闪烁会停止；后续有新事件时会重新提醒。
+- 点击打开会话后，如果开启 `click_acknowledges_sessions`，会把这条会话标记为已查看；后续有新事件时会重新提醒。
 - 右键灯外：打开全局菜单，可以切换状态、调整大小、设置闪烁、打开设置窗口、静音或退出。
 - 右侧额度细线：吸附在灯壳边缘显示剩余额度；hover tooltip 会显示 5 小时窗口和本地重刷时间，可在全局菜单或设置窗口关闭，默认开启。
 - 左下角拖拽：按比例缩放浮窗。
@@ -172,7 +177,6 @@ codex-light-run python3 script.py
 - 红灯未处理后是否自动加快。
 - 是否显示额度条。
 - 红灯加快阈值。
-- 绿灯自动变暗时间。
 - 会话过期时间。
 - 静音、找回浮窗、清空会话。
 
