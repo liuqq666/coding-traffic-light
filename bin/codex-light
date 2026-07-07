@@ -3,24 +3,18 @@
 PYTHON="${CODEX_PYTHON:-}"
 if [ -z "$PYTHON" ]; then
   CODEX_BUNDLED_PYTHON="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
-  if [ -x "$CODEX_BUNDLED_PYTHON" ]; then
-    PYTHON="$CODEX_BUNDLED_PYTHON"
-  else
-    PYTHON="python3"
-  fi
+  if [ -x "$CODEX_BUNDLED_PYTHON" ]; then PYTHON="$CODEX_BUNDLED_PYTHON"; else PYTHON="python3"; fi
 fi
 exec "$PYTHON" "$0" "$@"
 ':'''
 """Command helper for Codex Status Light."""
 
 import argparse
-import os
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional
-
 
 STATE_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "state.json"
 PREFERENCES_FILE = Path.home() / "Library" / "Application Support" / "CodexStatusLight" / "preferences.json"
@@ -30,59 +24,42 @@ CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 CODEX_ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
 STATES = {"working", "done", "waiting", "idle"}
 COMMANDS = {"quit", "show", "reset-position", "clear-sessions", "settings"}
-DONE_TTL_SECONDS = 10 * 60
-SESSION_TTL_SECONDS = 6 * 60 * 60
-RATE_LIMIT_RECENT_FILE_LIMIT = 20
-RATE_LIMIT_RECENT_MAX_AGE_SECONDS = 12 * 60 * 60
-PRIORITY = {"waiting": 3, "working": 2, "done": 1, "idle": 0}
-SESSION_METADATA_KEYS = (
-    "title",
-    "cwd",
-    "preview",
-    "source_event",
-    "tool_name",
-    "turn_id",
-    "transcript_path",
-    "model",
-)
+PRIORITY = {"waiting": 3, "done": 2, "working": 1, "idle": 0}
+DEFAULT_SESSION_STALE_SECONDS = 6 * 60 * 60
+METADATA_KEYS = ("title", "cwd", "preview", "source_event", "tool_name", "turn_id", "transcript_path", "model")
 
 
 def ensure_runtime() -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
-def atomic_write_json(path: Path, payload: dict) -> None:
+def read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def atomic_write(path: Path, payload: dict) -> None:
     ensure_runtime()
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
 
-def read_payload() -> dict:
+def pref_number(key: str, default: float) -> float:
     try:
-        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def read_preferences() -> dict:
-    try:
-        payload = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def preference_number(key: str, default: float) -> float:
-    value = read_preferences().get(key)
-    try:
-        return float(value)
+        return float(read_json(PREFERENCES_FILE).get(key, default))
     except Exception:
         return default
 
 
-def session_id_from_env() -> Optional[str]:
+def session_stale_seconds() -> float:
+    return max(60.0, pref_number("session_stale_seconds", DEFAULT_SESSION_STALE_SECONDS))
+
+
+def session_from_env() -> str | None:
     for key in ("CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CONVERSATION_ID", "CODEX_TASK_ID"):
         value = os.environ.get(key)
         if value:
@@ -90,48 +67,11 @@ def session_id_from_env() -> Optional[str]:
     return None
 
 
-def aggregate_state(payload: dict) -> str:
-    now = time.time()
-    candidates: list[str] = []
-    sessions = payload.get("sessions")
-    manual_state = payload.get("manual_state")
-    done_ttl_seconds = max(10, preference_number("done_auto_idle_seconds", DONE_TTL_SECONDS))
-    session_ttl_seconds = max(60, preference_number("session_stale_seconds", SESSION_TTL_SECONDS))
-    if manual_state in STATES:
-        candidates.append(manual_state)
-    elif not isinstance(sessions, dict) and payload.get("state") in STATES:
-        candidates.append(payload["state"])
-
-    if isinstance(sessions, dict):
-        for session_id, item in sessions.items():
-            if not isinstance(item, dict):
-                continue
-            if not session_openable(session_id, item):
-                continue
-            session_state = item.get("state")
-            updated_at = float(item.get("updated_at") or 0)
-            acknowledged_at = float(item.get("acknowledged_at") or 0)
-            if acknowledged_at >= updated_at:
-                continue
-            age = now - updated_at
-            if session_state == "done" and age > done_ttl_seconds:
-                continue
-            if session_state in {"working", "waiting"} and age > session_ttl_seconds:
-                continue
-            if session_state in STATES:
-                candidates.append(session_state)
-
-    if not candidates:
-        return "idle"
-    return max(candidates, key=lambda item: PRIORITY[item])
-
-
 def is_uuid(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 36:
         return False
-    hyphens = {8, 13, 18, 23}
     for index, char in enumerate(value):
-        if index in hyphens:
+        if index in {8, 13, 18, 23}:
             if char != "-":
                 return False
         elif char.lower() not in "0123456789abcdef":
@@ -139,21 +79,14 @@ def is_uuid(value: object) -> bool:
     return True
 
 
-def session_openable(session_id: str, item: dict) -> bool:
-    if not is_uuid(session_id):
-        return True
-    if directory_contains_session_id(CODEX_ARCHIVED_SESSIONS_DIR, session_id):
+def dir_has_session(directory: Path, session_id: str) -> bool:
+    try:
+        return any(session_id in item.name for item in directory.iterdir())
+    except Exception:
         return False
-    archived = sqlite_thread_archived(session_id)
-    if archived is not None:
-        return not archived
-    transcript_path = item.get("transcript_path")
-    if isinstance(transcript_path, str) and "/.codex/sessions/" in transcript_path and Path(transcript_path).exists():
-        return True
-    return directory_contains_session_id(CODEX_SESSIONS_DIR, session_id)
 
 
-def sqlite_thread_archived(session_id: str) -> Optional[bool]:
+def sqlite_archived(session_id: str) -> bool | None:
     if not CODEX_STATE_DB.exists():
         return None
     try:
@@ -161,296 +94,140 @@ def sqlite_thread_archived(session_id: str) -> Optional[bool]:
             row = connection.execute("SELECT archived FROM threads WHERE id = ? LIMIT 1", (session_id,)).fetchone()
     except Exception:
         return None
-    if row is None:
-        return None
-    return bool(row[0])
+    return None if row is None else bool(row[0])
 
 
-def directory_contains_session_id(directory: Path, session_id: str) -> bool:
-    try:
-        return any(session_id in item.name for item in directory.iterdir())
-    except Exception:
+def openable(session_id: str, item: dict) -> bool:
+    if not is_uuid(session_id):
         return False
+    if dir_has_session(CODEX_ARCHIVED_SESSIONS_DIR, session_id):
+        return False
+    archived = sqlite_archived(session_id)
+    if archived is not None:
+        return not archived
+    transcript = item.get("transcript_path")
+    if isinstance(transcript, str) and "/.codex/sessions/" in transcript and Path(transcript).exists():
+        return True
+    return dir_has_session(CODEX_SESSIONS_DIR, session_id)
 
 
-def compact_text(value: object, limit: int = 180) -> Optional[str]:
+def compact(value: object, limit: int = 300) -> str | None:
     if value is None:
         return None
-    if isinstance(value, (dict, list)):
-        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    else:
-        text = str(value)
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, (dict, list)) else str(value)
     text = " ".join(text.split())
     if not text:
         return None
-    if len(text) > limit:
-        return text[: limit - 1] + "…"
-    return text
+    return text[: limit - 1] + "…" if len(text) > limit else text
 
 
-def number_value(value: object) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def latest_token_count_payload(path: Path) -> Optional[dict]:
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as handle:
-            latest = None
-            for line in handle:
-                if '"token_count"' not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    continue
-                payload = event.get("payload")
-                if isinstance(payload, dict) and payload.get("type") == "token_count":
-                    latest = payload
-    except Exception:
-        return None
-    return latest if isinstance(latest, dict) else None
-
-
-def rate_limit_metadata_from_token_count(payload: dict) -> dict:
-    if not isinstance(payload, dict):
-        return {}
-    rate_limits = payload.get("rate_limits")
-    if not isinstance(rate_limits, dict):
-        return {}
-    primary = rate_limits.get("primary")
-    if not isinstance(primary, dict):
-        return {}
-
-    metadata = {}
-    used_percent = number_value(primary.get("used_percent"))
-    if used_percent is not None:
-        metadata["rate_limit_primary_used_percent"] = min(max(used_percent, 0.0), 100.0)
-        metadata["rate_limit_primary_remaining_percent"] = min(max(100.0 - used_percent, 0.0), 100.0)
-
-    window_minutes = number_value(primary.get("window_minutes"))
-    if window_minutes is not None:
-        metadata["rate_limit_primary_window_minutes"] = window_minutes
-
-    resets_at = number_value(primary.get("resets_at"))
-    if resets_at is not None:
-        metadata["rate_limit_primary_resets_at"] = resets_at
-
-    limit_name = compact_text(rate_limits.get("limit_name"), 120)
-    if limit_name:
-        metadata["rate_limit_name"] = limit_name
-    plan_type = compact_text(rate_limits.get("plan_type"), 40)
-    if plan_type:
-        metadata["rate_limit_plan_type"] = plan_type
-
-    return metadata
-
-
-def latest_rate_limit_metadata_from_path(path: Path) -> dict:
-    if not path.exists() or not path.is_file():
-        return {}
-    payload = latest_token_count_payload(path)
-    if not payload:
-        return {}
-    return rate_limit_metadata_from_token_count(payload)
-
-
-def recent_transcript_paths(preferred_path: object) -> list[Path]:
-    paths: list[tuple[float, Path]] = []
-    seen: set[str] = set()
-
-    def add_path(path: Path) -> None:
-        try:
-            resolved = str(path.expanduser().resolve())
-            stat = path.stat()
-        except Exception:
-            return
-        if resolved in seen or not path.is_file():
-            return
-        seen.add(resolved)
-        paths.append((stat.st_mtime, path))
-
-    if isinstance(preferred_path, str) and preferred_path:
-        add_path(Path(preferred_path))
-
-    if CODEX_SESSIONS_DIR.exists():
-        cutoff = time.time() - RATE_LIMIT_RECENT_MAX_AGE_SECONDS
-        try:
-            for path in CODEX_SESSIONS_DIR.rglob("*.jsonl"):
-                try:
-                    if path.stat().st_mtime < cutoff:
-                        continue
-                except Exception:
-                    continue
-                add_path(path)
-        except Exception:
-            pass
-
-    paths.sort(key=lambda item: item[0], reverse=True)
-    return [path for _, path in paths[:RATE_LIMIT_RECENT_FILE_LIMIT]]
-
-
-def active_five_hour_quota(metadata: dict) -> bool:
-    window = number_value(metadata.get("rate_limit_primary_window_minutes"))
-    resets_at = number_value(metadata.get("rate_limit_primary_resets_at"))
-    if window is None or resets_at is None:
-        return False
-    return 295 <= window <= 305 and resets_at > time.time()
-
-
-def best_rate_limit_metadata(candidates: list[dict]) -> dict:
-    usable = [metadata for metadata in candidates if metadata]
-    if not usable:
-        return {}
-    active = [metadata for metadata in usable if active_five_hour_quota(metadata)]
-    pool = active or usable
-
-    def score(metadata: dict) -> tuple[float, float, float]:
-        remaining = number_value(metadata.get("rate_limit_primary_remaining_percent"))
-        used = number_value(metadata.get("rate_limit_primary_used_percent"))
-        resets_at = number_value(metadata.get("rate_limit_primary_resets_at"))
-        return (
-            remaining if remaining is not None else 101.0,
-            -(used if used is not None else -1.0),
-            -(resets_at if resets_at is not None else 0.0),
-        )
-
-    return min(pool, key=score)
-
-
-def latest_rate_limit_metadata(transcript_path: object) -> dict:
-    candidates = [latest_rate_limit_metadata_from_path(path) for path in recent_transcript_paths(transcript_path)]
-    return best_rate_limit_metadata(candidates)
-
-
-def metadata_from_args(args: argparse.Namespace) -> dict:
-    metadata = {}
-    for key in SESSION_METADATA_KEYS:
-        value = compact_text(getattr(args, key, None), 300 if key in {"cwd", "transcript_path"} else 180)
+def metadata(args: argparse.Namespace) -> dict:
+    out = {}
+    for key in METADATA_KEYS:
+        value = compact(getattr(args, key, None), 300 if key in {"cwd", "transcript_path"} else 180)
         if value:
-            metadata[key] = value
-    metadata.update(latest_rate_limit_metadata(getattr(args, "transcript_path", None)))
-    return metadata
+            out[key] = value
+    return out
 
 
-def apply_rate_limit_metadata(payload: dict, metadata: Optional[dict]) -> None:
-    if not metadata:
-        return
-    rate_limit_keys = [
-        "rate_limit_primary_used_percent",
-        "rate_limit_primary_remaining_percent",
-        "rate_limit_primary_window_minutes",
-        "rate_limit_primary_resets_at",
-        "rate_limit_name",
-        "rate_limit_plan_type",
-    ]
-    changed = False
-    has_primary_rate_limit = any(key in metadata for key in rate_limit_keys[:4])
-    for key in rate_limit_keys:
-        if key in metadata:
-            payload[key] = metadata[key]
-            changed = True
-        elif has_primary_rate_limit and key in {"rate_limit_name", "rate_limit_plan_type"} and key in payload:
-            payload.pop(key, None)
-            changed = True
-    if changed:
-        payload["rate_limit_updated_at"] = time.time()
+def candidate_state(now: float, session_id: str, item: object) -> str | None:
+    if not isinstance(item, dict) or not openable(session_id, item):
+        return None
+    state = item.get("state")
+    if state not in STATES:
+        return None
+    updated_at = float(item.get("updated_at") or 0)
+    acknowledged_at = float(item.get("acknowledged_at") or 0)
+    if state == "working":
+        return "working" if now - updated_at <= session_stale_seconds() else None
+    if state in {"done", "waiting"}:
+        return state if acknowledged_at < updated_at else None
+    return None
 
 
-def write_state(state: str, session_id: Optional[str] = None, metadata: Optional[dict] = None) -> None:
+def aggregate(payload: dict) -> str:
+    now = time.time()
+    sessions = payload.get("sessions")
+    states = []
+    manual = payload.get("manual_state")
+    if manual in STATES:
+        states.append(manual)
+    elif not isinstance(sessions, dict) and payload.get("state") in STATES:
+        states.append(payload["state"])
+    if isinstance(sessions, dict):
+        for session_id, item in sessions.items():
+            state = candidate_state(now, session_id, item)
+            if state:
+                states.append(state)
+    return max(states, key=lambda value: PRIORITY[value]) if states else "idle"
+
+
+def write_state(state: str, session_id: str | None, meta: dict) -> None:
+    if meta.get("source_event") in {"Stop", "SubagentStop"}:
+        state = "done"
     if state not in STATES:
         raise SystemExit(f"Unknown state: {state}")
-    payload = read_payload()
+    payload = read_json(STATE_FILE)
     now = time.time()
-    apply_rate_limit_metadata(payload, metadata)
-
     if session_id:
         sessions = payload.get("sessions")
-        if not isinstance(sessions, dict):
-            sessions = {}
+        sessions = sessions if isinstance(sessions, dict) else {}
         if state == "idle":
             sessions.pop(session_id, None)
         else:
-            previous = sessions.get(session_id)
-            item = previous.copy() if isinstance(previous, dict) else {}
-            item.update({"state": state, "updated_at": now})
-            for key, value in (metadata or {}).items():
-                item[key] = value
-            item["id"] = session_id
+            item = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {}
+            item.update({"id": session_id, "state": state, "updated_at": now, **meta})
             sessions[session_id] = item
         payload["sessions"] = sessions
-        payload["state"] = aggregate_state(payload)
+        payload["state"] = aggregate(payload)
     else:
         payload["manual_state"] = state
+        payload["sessions"] = {}
         payload["state"] = state
-
     payload["updated_at"] = now
     payload.pop("command", None)
-    atomic_write_json(STATE_FILE, payload)
+    atomic_write(STATE_FILE, payload)
 
 
 def write_command(command: str) -> None:
-    payload = read_payload()
+    payload = read_json(STATE_FILE)
     payload["command"] = command
     payload["updated_at"] = time.time()
     if command == "clear-sessions":
         payload["sessions"] = {}
-        payload["state"] = aggregate_state(payload)
-    elif command == "quit":
-        payload["state"] = "quit"
-    else:
-        payload["state"] = aggregate_state(payload)
-    atomic_write_json(STATE_FILE, payload)
+    payload["state"] = "quit" if command == "quit" else aggregate(payload)
+    atomic_write(STATE_FILE, payload)
 
 
-def reset_position_preference() -> None:
-    try:
-        prefs = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
-        if not isinstance(prefs, dict):
-            prefs = {}
-    except Exception:
-        prefs = {}
+def reset_position() -> None:
+    prefs = read_json(PREFERENCES_FILE)
     prefs.pop("window_x", None)
     prefs.pop("window_y", None)
     prefs["updated_at"] = time.time()
-    atomic_write_json(PREFERENCES_FILE, prefs)
-
-
-def read_state() -> str:
-    return aggregate_state(read_payload())
+    atomic_write(PREFERENCES_FILE, prefs)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Codex Status Light command helper")
-    parser.add_argument("command", choices=[*sorted(STATES), *sorted(COMMANDS), "status"], help="State command")
-    parser.add_argument("--session", default=None, help="Session id for multi-session aggregation")
-    parser.add_argument("--title", default=None, help="Session title shown in menus")
-    parser.add_argument("--cwd", default=None, help="Session working directory")
-    parser.add_argument("--preview", default=None, help="Short session preview")
-    parser.add_argument("--source-event", default=None, help="Codex hook event name")
-    parser.add_argument("--tool-name", default=None, help="Codex tool name")
-    parser.add_argument("--turn-id", default=None, help="Codex turn id")
-    parser.add_argument("--transcript-path", default=None, help="Codex transcript path")
-    parser.add_argument("--model", default=None, help="Codex model")
+    parser.add_argument("command", choices=[*sorted(STATES), *sorted(COMMANDS), "status"])
+    parser.add_argument("--session")
+    for key in METADATA_KEYS:
+        parser.add_argument("--" + key.replace("_", "-"), dest=key)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     if args.command == "status":
-        print(read_state())
+        print(aggregate(read_json(STATE_FILE)))
         return 0
     if args.command in COMMANDS:
         if args.command == "reset-position":
-            reset_position_preference()
+            reset_position()
         write_command(args.command)
         print(args.command)
         return 0
-    write_state(args.command, args.session or session_id_from_env(), metadata_from_args(args))
+    write_state(args.command, args.session or session_from_env(), metadata(args))
     print(args.command)
     return 0
 
