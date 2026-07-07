@@ -1,0 +1,117 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+LIGHT="${CODEX_LIGHT_PATH:-$SCRIPT_DIR/codex-light}"
+if [ ! -x "$LIGHT" ]; then
+  FOUND_LIGHT="$(command -v codex-light 2>/dev/null || true)"
+  [ -n "$FOUND_LIGHT" ] && LIGHT="$FOUND_LIGHT"
+fi
+LIGHT_LABEL="com.liuqq666.codex-status-light"
+SUPPORT_DIR="$HOME/Library/Application Support/CodexStatusLight"
+LOG_PATH="$SUPPORT_DIR/hook.log"
+EVENT_FILE="${TMPDIR:-/tmp}/codex-light.$$.json"
+
+log() {
+  mkdir -p "$SUPPORT_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$LOG_PATH" 2>/dev/null || true
+}
+
+status_light_running() {
+  pgrep -x CodexStatusLight >/dev/null 2>&1
+}
+
+ensure_status_light_running() {
+  status_light_running && return 0
+  if launchctl kickstart -k "gui/$(id -u)/$LIGHT_LABEL" >/dev/null 2>&1; then
+    log "ensure-running launchctl"
+    return 0
+  fi
+  if status_light_running; then
+    log "ensure-running launchctl-result-existing"
+  fi
+}
+
+json_value() {
+  key="$1"
+  python3 - "$EVENT_FILE" "$key" <<'PY'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as handle:
+        event = json.load(handle)
+except Exception:
+    event = {}
+value = event.get(key) if isinstance(event, dict) else None
+if value is None:
+    sys.exit(0)
+if isinstance(value, (dict, list)):
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+else:
+    text = str(value)
+print(" ".join(text.split())[:300])
+PY
+}
+
+first_value() {
+  for key in "$@"; do
+    value="$(json_value "$key" || true)"
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 0
+}
+
+session_id() {
+  value="$(first_value session_id thread_id conversation_id task_id)"
+  if [ -n "$value" ]; then printf '%s\n' "$value"; return 0; fi
+  for key in CODEX_SESSION_ID CODEX_THREAD_ID CODEX_CONVERSATION_ID CODEX_TASK_ID; do
+    eval "value=\${$key:-}"
+    if [ -n "$value" ]; then printf '%s\n' "$value"; return 0; fi
+  done
+  cwd="$(first_value cwd)"
+  [ -n "$cwd" ] || cwd="${PWD:-unknown}"
+  printf 'hook:%s\n' "$cwd"
+}
+
+set_light() {
+  state="$1"
+  name="$2"
+  sid="$(session_id)"
+  title="$(first_value prompt cwd tool_name)"
+  [ -n "$title" ] || title="$sid"
+  cwd="$(first_value cwd)"
+  [ -n "$cwd" ] || cwd="${PWD:-}"
+  preview="$name"
+  case "$name" in
+    UserPromptSubmit) preview="$(first_value prompt)" ;;
+    PreToolUse) preview="$(first_value tool_name tool_input)" ;;
+    PermissionRequest) preview="$(first_value message reason tool_input)" ;;
+    Stop|SubagentStop) preview="$(first_value last_assistant_message)" ;;
+  esac
+  [ -n "$preview" ] || preview="$name"
+  args="$state --session $sid --title $title --source-event $name --preview $preview"
+  if [ -n "$cwd" ]; then
+    "$LIGHT" "$state" --session "$sid" --title "$title" --source-event "$name" --preview "$preview" --cwd "$cwd" >/dev/null 2>&1 || true
+  else
+    "$LIGHT" "$state" --session "$sid" --title "$title" --source-event "$name" --preview "$preview" >/dev/null 2>&1 || true
+  fi
+  log "set $state"
+}
+
+cleanup() { rm -f "$EVENT_FILE"; }
+trap cleanup EXIT
+cat > "$EVENT_FILE"
+[ -s "$EVENT_FILE" ] || printf '{}\n' > "$EVENT_FILE"
+name="$(first_value hook_event_name)"
+[ -n "$name" ] || name="${1:-}"
+log "event $name session=$(session_id)"
+ensure_status_light_running
+case "$name" in
+  UserPromptSubmit|PreToolUse) set_light working "$name" ;;
+  PermissionRequest) set_light waiting "$name" ;;
+  Stop|SubagentStop) set_light done "$name" ;;
+esac
+printf '{}\n'
