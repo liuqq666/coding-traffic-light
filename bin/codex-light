@@ -14,8 +14,8 @@ exec "$PYTHON" "$0" "$@"
 """Command helper for Codex Status Light."""
 
 import argparse
-import os
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -30,11 +30,8 @@ CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 CODEX_ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
 STATES = {"working", "done", "waiting", "idle"}
 COMMANDS = {"quit", "show", "reset-position", "clear-sessions", "settings"}
-DONE_TTL_SECONDS = 10 * 60
 SESSION_TTL_SECONDS = 6 * 60 * 60
-RATE_LIMIT_RECENT_FILE_LIMIT = 20
-RATE_LIMIT_RECENT_MAX_AGE_SECONDS = 12 * 60 * 60
-PRIORITY = {"waiting": 3, "working": 2, "done": 1, "idle": 0}
+PRIORITY = {"waiting": 3, "done": 2, "working": 1, "idle": 0}
 SESSION_METADATA_KEYS = (
     "title",
     "cwd",
@@ -45,6 +42,8 @@ SESSION_METADATA_KEYS = (
     "transcript_path",
     "model",
 )
+RATE_LIMIT_RECENT_FILE_LIMIT = 20
+RATE_LIMIT_RECENT_MAX_AGE_SECONDS = 12 * 60 * 60
 
 
 def ensure_runtime() -> None:
@@ -54,7 +53,7 @@ def ensure_runtime() -> None:
 def atomic_write_json(path: Path, payload: dict) -> None:
     ensure_runtime()
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -90,42 +89,6 @@ def session_id_from_env() -> Optional[str]:
     return None
 
 
-def aggregate_state(payload: dict) -> str:
-    now = time.time()
-    candidates: list[str] = []
-    sessions = payload.get("sessions")
-    manual_state = payload.get("manual_state")
-    done_ttl_seconds = max(10, preference_number("done_auto_idle_seconds", DONE_TTL_SECONDS))
-    session_ttl_seconds = max(60, preference_number("session_stale_seconds", SESSION_TTL_SECONDS))
-    if manual_state in STATES:
-        candidates.append(manual_state)
-    elif not isinstance(sessions, dict) and payload.get("state") in STATES:
-        candidates.append(payload["state"])
-
-    if isinstance(sessions, dict):
-        for session_id, item in sessions.items():
-            if not isinstance(item, dict):
-                continue
-            if not session_openable(session_id, item):
-                continue
-            session_state = item.get("state")
-            updated_at = float(item.get("updated_at") or 0)
-            acknowledged_at = float(item.get("acknowledged_at") or 0)
-            if acknowledged_at >= updated_at:
-                continue
-            age = now - updated_at
-            if session_state == "done" and age > done_ttl_seconds:
-                continue
-            if session_state in {"working", "waiting"} and age > session_ttl_seconds:
-                continue
-            if session_state in STATES:
-                candidates.append(session_state)
-
-    if not candidates:
-        return "idle"
-    return max(candidates, key=lambda item: PRIORITY[item])
-
-
 def is_uuid(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 36:
         return False
@@ -139,18 +102,11 @@ def is_uuid(value: object) -> bool:
     return True
 
 
-def session_openable(session_id: str, item: dict) -> bool:
-    if not is_uuid(session_id):
-        return True
-    if directory_contains_session_id(CODEX_ARCHIVED_SESSIONS_DIR, session_id):
+def directory_contains_session_id(directory: Path, session_id: str) -> bool:
+    try:
+        return any(session_id in item.name for item in directory.iterdir())
+    except Exception:
         return False
-    archived = sqlite_thread_archived(session_id)
-    if archived is not None:
-        return not archived
-    transcript_path = item.get("transcript_path")
-    if isinstance(transcript_path, str) and "/.codex/sessions/" in transcript_path and Path(transcript_path).exists():
-        return True
-    return directory_contains_session_id(CODEX_SESSIONS_DIR, session_id)
 
 
 def sqlite_thread_archived(session_id: str) -> Optional[bool]:
@@ -166,11 +122,62 @@ def sqlite_thread_archived(session_id: str) -> Optional[bool]:
     return bool(row[0])
 
 
-def directory_contains_session_id(directory: Path, session_id: str) -> bool:
-    try:
-        return any(session_id in item.name for item in directory.iterdir())
-    except Exception:
+def session_openable(session_id: str, item: dict) -> bool:
+    if not is_uuid(session_id):
         return False
+    if directory_contains_session_id(CODEX_ARCHIVED_SESSIONS_DIR, session_id):
+        return False
+    archived = sqlite_thread_archived(session_id)
+    if archived is not None:
+        return not archived
+    transcript_path = item.get("transcript_path")
+    if isinstance(transcript_path, str) and "/.codex/sessions/" in transcript_path and Path(transcript_path).exists():
+        return True
+    return directory_contains_session_id(CODEX_SESSIONS_DIR, session_id)
+
+
+def session_stale_seconds() -> float:
+    return max(60.0, preference_number("session_stale_seconds", SESSION_TTL_SECONDS))
+
+
+def session_candidate_state(now: float, session_id: str, item: dict) -> Optional[str]:
+    if not isinstance(item, dict) or not session_openable(session_id, item):
+        return None
+    state = item.get("state")
+    if state not in STATES:
+        return None
+    updated_at = float(item.get("updated_at") or 0)
+    acknowledged_at = float(item.get("acknowledged_at") or 0)
+    if state == "working":
+        if now - updated_at > session_stale_seconds():
+            return None
+        return "working"
+    if state in {"done", "waiting"}:
+        if acknowledged_at >= updated_at:
+            return None
+        return state
+    return None
+
+
+def aggregate_state(payload: dict) -> str:
+    now = time.time()
+    candidates: list[str] = []
+    sessions = payload.get("sessions")
+    manual_state = payload.get("manual_state")
+    if manual_state in STATES:
+        candidates.append(manual_state)
+    elif not isinstance(sessions, dict) and payload.get("state") in STATES:
+        candidates.append(payload["state"])
+
+    if isinstance(sessions, dict):
+        for session_id, item in sessions.items():
+            state = session_candidate_state(now, session_id, item)
+            if state:
+                candidates.append(state)
+
+    if not candidates:
+        return "idle"
+    return max(candidates, key=lambda item: PRIORITY[item])
 
 
 def compact_text(value: object, limit: int = 180) -> Optional[str]:
@@ -231,32 +238,19 @@ def rate_limit_metadata_from_token_count(payload: dict) -> dict:
     if used_percent is not None:
         metadata["rate_limit_primary_used_percent"] = min(max(used_percent, 0.0), 100.0)
         metadata["rate_limit_primary_remaining_percent"] = min(max(100.0 - used_percent, 0.0), 100.0)
-
     window_minutes = number_value(primary.get("window_minutes"))
     if window_minutes is not None:
         metadata["rate_limit_primary_window_minutes"] = window_minutes
-
     resets_at = number_value(primary.get("resets_at"))
     if resets_at is not None:
         metadata["rate_limit_primary_resets_at"] = resets_at
-
     limit_name = compact_text(rate_limits.get("limit_name"), 120)
     if limit_name:
         metadata["rate_limit_name"] = limit_name
     plan_type = compact_text(rate_limits.get("plan_type"), 40)
     if plan_type:
         metadata["rate_limit_plan_type"] = plan_type
-
     return metadata
-
-
-def latest_rate_limit_metadata_from_path(path: Path) -> dict:
-    if not path.exists() or not path.is_file():
-        return {}
-    payload = latest_token_count_payload(path)
-    if not payload:
-        return {}
-    return rate_limit_metadata_from_token_count(payload)
 
 
 def recent_transcript_paths(preferred_path: object) -> list[Path]:
@@ -265,8 +259,8 @@ def recent_transcript_paths(preferred_path: object) -> list[Path]:
 
     def add_path(path: Path) -> None:
         try:
-            resolved = str(path.expanduser().resolve())
             stat = path.stat()
+            resolved = str(path.expanduser().resolve())
         except Exception:
             return
         if resolved in seen or not path.is_file():
@@ -276,7 +270,6 @@ def recent_transcript_paths(preferred_path: object) -> list[Path]:
 
     if isinstance(preferred_path, str) and preferred_path:
         add_path(Path(preferred_path))
-
     if CODEX_SESSIONS_DIR.exists():
         cutoff = time.time() - RATE_LIMIT_RECENT_MAX_AGE_SECONDS
         try:
@@ -289,42 +282,20 @@ def recent_transcript_paths(preferred_path: object) -> list[Path]:
                 add_path(path)
         except Exception:
             pass
-
     paths.sort(key=lambda item: item[0], reverse=True)
     return [path for _, path in paths[:RATE_LIMIT_RECENT_FILE_LIMIT]]
 
 
-def active_five_hour_quota(metadata: dict) -> bool:
-    window = number_value(metadata.get("rate_limit_primary_window_minutes"))
-    resets_at = number_value(metadata.get("rate_limit_primary_resets_at"))
-    if window is None or resets_at is None:
-        return False
-    return 295 <= window <= 305 and resets_at > time.time()
-
-
-def best_rate_limit_metadata(candidates: list[dict]) -> dict:
-    usable = [metadata for metadata in candidates if metadata]
+def latest_rate_limit_metadata(transcript_path: object) -> dict:
+    candidates = []
+    for path in recent_transcript_paths(transcript_path):
+        payload = latest_token_count_payload(path)
+        if payload:
+            candidates.append(rate_limit_metadata_from_token_count(payload))
+    usable = [candidate for candidate in candidates if candidate]
     if not usable:
         return {}
-    active = [metadata for metadata in usable if active_five_hour_quota(metadata)]
-    pool = active or usable
-
-    def score(metadata: dict) -> tuple[float, float, float]:
-        remaining = number_value(metadata.get("rate_limit_primary_remaining_percent"))
-        used = number_value(metadata.get("rate_limit_primary_used_percent"))
-        resets_at = number_value(metadata.get("rate_limit_primary_resets_at"))
-        return (
-            remaining if remaining is not None else 101.0,
-            -(used if used is not None else -1.0),
-            -(resets_at if resets_at is not None else 0.0),
-        )
-
-    return min(pool, key=score)
-
-
-def latest_rate_limit_metadata(transcript_path: object) -> dict:
-    candidates = [latest_rate_limit_metadata_from_path(path) for path in recent_transcript_paths(transcript_path)]
-    return best_rate_limit_metadata(candidates)
+    return usable[0]
 
 
 def metadata_from_args(args: argparse.Namespace) -> dict:
@@ -340,7 +311,7 @@ def metadata_from_args(args: argparse.Namespace) -> dict:
 def apply_rate_limit_metadata(payload: dict, metadata: Optional[dict]) -> None:
     if not metadata:
         return
-    rate_limit_keys = [
+    keys = [
         "rate_limit_primary_used_percent",
         "rate_limit_primary_remaining_percent",
         "rate_limit_primary_window_minutes",
@@ -349,13 +320,9 @@ def apply_rate_limit_metadata(payload: dict, metadata: Optional[dict]) -> None:
         "rate_limit_plan_type",
     ]
     changed = False
-    has_primary_rate_limit = any(key in metadata for key in rate_limit_keys[:4])
-    for key in rate_limit_keys:
+    for key in keys:
         if key in metadata:
             payload[key] = metadata[key]
-            changed = True
-        elif has_primary_rate_limit and key in {"rate_limit_name", "rate_limit_plan_type"} and key in payload:
-            payload.pop(key, None)
             changed = True
     if changed:
         payload["rate_limit_updated_at"] = time.time()
@@ -377,15 +344,15 @@ def write_state(state: str, session_id: Optional[str] = None, metadata: Optional
         else:
             previous = sessions.get(session_id)
             item = previous.copy() if isinstance(previous, dict) else {}
-            item.update({"state": state, "updated_at": now})
+            item.update({"state": state, "updated_at": now, "id": session_id})
             for key, value in (metadata or {}).items():
                 item[key] = value
-            item["id"] = session_id
             sessions[session_id] = item
         payload["sessions"] = sessions
         payload["state"] = aggregate_state(payload)
     else:
         payload["manual_state"] = state
+        payload["sessions"] = {}
         payload["state"] = state
 
     payload["updated_at"] = now
