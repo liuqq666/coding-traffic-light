@@ -1,14 +1,17 @@
 import Cocoa
+import Darwin
 import Foundation
 
 let supportDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/CodexStatusLight")
 let stateFile = supportDir.appendingPathComponent("state.json")
 let preferencesFile = supportDir.appendingPathComponent("preferences.json")
+let instanceLockFile = supportDir.appendingPathComponent("instance.lock")
 let codexHomeDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
 let codexStateDatabase = codexHomeDir.appendingPathComponent("state_5.sqlite")
 let codexSessionsDir = codexHomeDir.appendingPathComponent("sessions")
 let codexArchivedSessionsDir = codexHomeDir.appendingPathComponent("archived_sessions")
+var instanceLockFD: Int32 = -1
 var codexThreadOpenabilityCache: [String: (openable: Bool, checkedAt: TimeInterval)] = [:]
 
 let labels: [String: String] = [
@@ -1697,6 +1700,40 @@ func ensureRuntime() {
     try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
 }
 
+func acquireSingleInstanceLock() -> Bool {
+    ensureRuntime()
+    let fd = open(instanceLockFile.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+    guard fd >= 0 else {
+        return true
+    }
+    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        close(fd)
+        requestExistingInstanceToShow()
+        return false
+    }
+
+    instanceLockFD = fd
+    let pidText = "\(ProcessInfo.processInfo.processIdentifier)\n"
+    _ = ftruncate(fd, 0)
+    _ = pidText.withCString { pointer in
+        write(fd, pointer, strlen(pointer))
+    }
+    return true
+}
+
+func requestExistingInstanceToShow() {
+    ensureRuntime()
+    var object = readStateObject()
+    if object["state"] == nil {
+        object["state"] = "idle"
+    }
+    object["command"] = "show"
+    object["updated_at"] = Date().timeIntervalSince1970
+    if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) {
+        try? data.write(to: stateFile)
+    }
+}
+
 func writeState(_ state: String) {
     ensureRuntime()
     let body: [String: Any] = ["state": state, "manual_state": state, "updated_at": Date().timeIntervalSince1970]
@@ -2142,6 +2179,10 @@ extension NSColor {
         let blue = CGFloat(value & 0xff) / 255
         self.init(calibratedRed: red, green: green, blue: blue, alpha: 1)
     }
+}
+
+guard acquireSingleInstanceLock() else {
+    exit(0)
 }
 
 let app = NSApplication.shared
