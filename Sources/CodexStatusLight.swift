@@ -24,6 +24,14 @@ let labels: [String: String] = [
 let stateOrder = ["working", "done", "waiting", "idle"]
 let baseDesignWidth: CGFloat = 162
 let baseDesignHeight: CGFloat = 384
+let sidebarDesignWidth: CGFloat = 34
+let sidebarDesignHeight: CGFloat = 96
+let sidebarWidthInset: CGFloat = 3
+let sidebarPixelBlockSize: CGFloat = 28
+let sidebarPixelBlockGap: CGFloat = 1
+let sidebarSnapDistance: CGFloat = 32
+let sidebarPreferenceKey = "sidebar_edge"
+let sidebarYPreferenceKey = "sidebar_y"
 let fiveHourQuotaPanelWidth: CGFloat = 12
 let fiveHourQuotaPreferenceKey = "five_hour_quota_visible"
 var uiScale: CGFloat = readCGFloatPreference("scale") ?? 0.74
@@ -33,7 +41,17 @@ let defaultSessionStaleSeconds: TimeInterval = 6 * 60 * 60
 let realTrafficLightAssetPrefix = "traffic-light-real"
 
 func currentWindowSize() -> NSSize {
-    NSSize(width: currentDesignWidth() * uiScale, height: currentDesignHeight() * uiScale)
+    if sidebarEdgePreference() != nil {
+        return windowSize(sidebar: true)
+    }
+    return windowSize(sidebar: false)
+}
+
+func windowSize(sidebar: Bool) -> NSSize {
+    if sidebar {
+        return NSSize(width: sidebarDesignWidth * uiScale, height: sidebarDesignHeight * uiScale)
+    }
+    return NSSize(width: currentDesignWidth() * uiScale, height: currentDesignHeight() * uiScale)
 }
 
 func currentDesignWidth() -> CGFloat {
@@ -48,16 +66,47 @@ func fiveHourQuotaVisible() -> Bool {
     readBoolPreference(fiveHourQuotaPreferenceKey) ?? true
 }
 
+func sidebarEdgePreference() -> String? {
+    guard let edge = readStringPreference(sidebarPreferenceKey),
+          edge == "left" || edge == "right" else {
+        return nil
+    }
+    return edge
+}
+
+func visibleScreen(for frame: NSRect) -> NSScreen? {
+    NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? NSScreen.main
+}
+
 func clampedOriginForVisibleScreen(_ origin: NSPoint, size: NSSize) -> NSPoint {
-    guard let screen = NSScreen.screens.first(where: { screen in
-        screen.visibleFrame.intersects(NSRect(x: origin.x, y: origin.y, width: size.width, height: size.height))
-    }) ?? NSScreen.main else {
+    let testFrame = NSRect(x: origin.x, y: origin.y, width: size.width, height: size.height)
+    guard let screen = visibleScreen(for: testFrame) else {
         return origin
     }
     let frame = screen.visibleFrame
     let x = min(max(origin.x, frame.minX + 8), frame.maxX - size.width - 8)
     let y = min(max(origin.y, frame.minY + 8), frame.maxY - size.height - 8)
     return NSPoint(x: x, y: y)
+}
+
+func sidebarOrigin(edge: String, preferredMidY: CGFloat?, size: NSSize, screen: NSScreen) -> NSPoint {
+    let frame = screen.visibleFrame
+    let x = edge == "left" ? frame.minX : frame.maxX - size.width
+    let midY = preferredMidY ?? frame.midY
+    let y = min(max(midY - size.height / 2, frame.minY + 8), frame.maxY - size.height - 8)
+    return NSPoint(x: x, y: y)
+}
+
+func sidebarTargetEdge(for frame: NSRect) -> String? {
+    guard let screen = visibleScreen(for: frame) else { return nil }
+    let visible = screen.visibleFrame
+    if frame.minX <= visible.minX + sidebarSnapDistance {
+        return "left"
+    }
+    if frame.maxX >= visible.maxX - sidebarSnapDistance {
+        return "right"
+    }
+    return nil
 }
 
 func blinkEnabledKey(for light: String) -> String {
@@ -346,6 +395,7 @@ final class TrafficLightView: NSView {
     var openFeedbackUntil = Date.distantPast
     var openFeedbackTitle: String?
     var onStateCommand: ((String) -> Void)?
+    var onSidebarEdgeChange: ((String?) -> Void)?
     weak var ownerWindow: NSWindow?
 
     override var acceptsFirstResponder: Bool { true }
@@ -360,7 +410,9 @@ final class TrafficLightView: NSView {
         transform.scale(by: uiScale)
         transform.concat()
 
-        if Self.realTrafficLightImages["idle"] != nil {
+        if sidebarEdgePreference() != nil {
+            drawSidebarTrafficLight()
+        } else if Self.realTrafficLightImages["idle"] != nil {
             drawPhotoTrafficLight()
         } else {
             let body = NSRect(x: 14, y: 8, width: 134, height: 368)
@@ -370,11 +422,13 @@ final class TrafficLightView: NSView {
             drawLamp(center: NSPoint(x: 81, y: 78), light: "green", intensity: intensity(for: "green"))
         }
 
-        drawFiveHourQuotaPanel()
+        if sidebarEdgePreference() == nil {
+            drawFiveHourQuotaPanel()
+        }
         drawOpenFeedback()
         NSGraphicsContext.restoreGraphicsState()
 
-        if isHoveringResizeHandle || isResizing {
+        if sidebarEdgePreference() == nil && (isHoveringResizeHandle || isResizing) {
             drawResizeHandle()
         }
     }
@@ -500,6 +554,88 @@ final class TrafficLightView: NSView {
         }
     }
 
+    func sidebarBodyRect() -> NSRect {
+        let width = sidebarPixelBlockSize + 4
+        let height = sidebarPixelBlockSize * 3 + sidebarPixelBlockGap * 2 + 4
+        let y = (sidebarDesignHeight - height) / 2
+        if sidebarEdgePreference() == "left" {
+            return NSRect(x: 0, y: y, width: width, height: height)
+        }
+        return NSRect(x: sidebarDesignWidth - width, y: y, width: width, height: height)
+    }
+
+    func sidebarLampRect(for light: String) -> NSRect {
+        let body = sidebarBodyRect()
+        let index: CGFloat
+        switch light {
+        case "red": index = 2
+        case "yellow": index = 1
+        case "green": index = 0
+        default: index = 1
+        }
+        let x = body.midX - sidebarPixelBlockSize / 2
+        let y = body.minY + 2 + index * (sidebarPixelBlockSize + sidebarPixelBlockGap)
+        return NSRect(x: x, y: y, width: sidebarPixelBlockSize, height: sidebarPixelBlockSize)
+    }
+
+    func drawSidebarTrafficLight() {
+        let edge = sidebarEdgePreference() ?? "right"
+        let body = sidebarBodyRect()
+        NSColor.black.withAlphaComponent(0.78).setFill()
+        NSBezierPath(rect: body).fill()
+
+        let inner = body.insetBy(dx: 1, dy: 1)
+        NSColor(hex: "#111311").withAlphaComponent(0.94).setFill()
+        NSBezierPath(rect: inner).fill()
+
+        let dockWidth: CGFloat = 2
+        let dockX = edge == "left" ? body.minX : body.maxX - dockWidth
+        NSColor.black.withAlphaComponent(0.92).setFill()
+        NSBezierPath(rect: NSRect(x: dockX, y: body.minY, width: dockWidth, height: body.height)).fill()
+
+        for light in ["red", "yellow", "green"] {
+            drawSidebarLamp(light: light, rect: sidebarLampRect(for: light), intensity: intensity(for: light))
+        }
+    }
+
+    func drawSidebarLamp(light: String, rect: NSRect, intensity: CGFloat) {
+        let active = isLightVisible(light) || stateName(for: light) == state
+        let color = sidebarPixelColor(for: light, active: active)
+        let brightness = active ? max(0.62, intensity) : 0.18
+        let fill = color.blended(withFraction: active ? 0.05 : 0.78, of: NSColor.black) ?? color
+
+        if active {
+            color.withAlphaComponent(0.16 * intensity).setFill()
+            NSBezierPath(rect: rect.insetBy(dx: -2, dy: -2)).fill()
+        }
+
+        fill.withAlphaComponent(brightness).setFill()
+        NSBezierPath(rect: rect).fill()
+
+        NSColor.black.withAlphaComponent(0.70).setStroke()
+        let border = NSBezierPath(rect: rect)
+        border.lineWidth = 1
+        border.stroke()
+
+        let topLeft = NSRect(x: rect.minX + 3, y: rect.maxY - 8, width: rect.width - 7, height: 4)
+        NSColor.white.withAlphaComponent(active ? 0.26 * brightness : 0.035).setFill()
+        NSBezierPath(rect: topLeft).fill()
+
+        let rightShade = NSRect(x: rect.maxX - 5, y: rect.minY + 4, width: 2, height: rect.height - 8)
+        NSColor.black.withAlphaComponent(active ? 0.22 : 0.52).setFill()
+        NSBezierPath(rect: rightShade).fill()
+    }
+
+    func sidebarPixelColor(for light: String, active: Bool) -> NSColor {
+        guard active else { return baseColorFor(light) }
+        switch light {
+        case "red": return NSColor(hex: "#ff3026")
+        case "yellow": return NSColor(hex: "#ffd11a")
+        case "green": return NSColor(hex: "#22e66c")
+        default: return baseColorFor(light)
+        }
+    }
+
     func quotaAccentColor(for quota: FiveHourQuota?) -> NSColor {
         guard quota != nil else {
             return NSColor(hex: "#8c9494")
@@ -530,8 +666,13 @@ final class TrafficLightView: NSView {
 
     func drawOpenFeedback() {
         guard hasOpenFeedback(), let light = openFeedbackLight else { return }
-        let imageRect = photoImageRect()
-        let rect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -5, dy: -5)
+        let rect: NSRect
+        if sidebarEdgePreference() != nil {
+            rect = sidebarLampRect(for: light).insetBy(dx: -5, dy: -5)
+        } else {
+            let imageRect = photoImageRect()
+            rect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -5, dy: -5)
+        }
         let progress = CGFloat(max(0, min(1, openFeedbackUntil.timeIntervalSinceNow / 0.7)))
         let alpha = 0.18 + 0.36 * progress
 
@@ -951,12 +1092,16 @@ final class TrafficLightView: NSView {
     }
 
     func resizeHandleRect() -> NSRect {
+        if sidebarEdgePreference() != nil {
+            return .zero
+        }
         let side = min(max(bounds.width * 0.18, 22), 36)
         return NSRect(x: bounds.minX, y: bounds.minY, width: side, height: side)
     }
 
     func pointIsInResizeHandle(_ event: NSEvent) -> Bool {
-        resizeHandleRect().contains(convert(event.locationInWindow, from: nil))
+        guard sidebarEdgePreference() == nil else { return false }
+        return resizeHandleRect().contains(convert(event.locationInWindow, from: nil))
     }
 
     func updateResizeHandleHover(with event: NSEvent) {
@@ -1032,6 +1177,10 @@ final class TrafficLightView: NSView {
             updateResizeHandleHover(with: event)
             return
         }
+        if didDrag {
+            finishWindowDrag()
+            return
+        }
         guard !didDrag, event.clickCount == 1 else { return }
         if openClickedLampSession(with: event) {
             return
@@ -1055,6 +1204,26 @@ final class TrafficLightView: NSView {
         window.setFrameOrigin(frame.origin)
         updatePreference("window_x", value: Double(frame.origin.x))
         updatePreference("window_y", value: Double(frame.origin.y))
+    }
+
+    func finishWindowDrag() {
+        guard let window = ownerWindow else { return }
+        let currentEdge = sidebarEdgePreference()
+        let targetEdge = sidebarTargetEdge(for: window.frame)
+        if let targetEdge {
+            onSidebarEdgeChange?(targetEdge)
+            return
+        }
+        if currentEdge != nil {
+            onSidebarEdgeChange?(nil)
+            return
+        }
+        let origin = clampedOriginForVisibleScreen(window.frame.origin, size: window.frame.size)
+        if origin != window.frame.origin {
+            window.setFrameOrigin(origin)
+        }
+        updatePreference("window_x", value: Double(origin.x))
+        updatePreference("window_y", value: Double(origin.y))
     }
 
     func resizeWindow(to mouseLocation: NSPoint) {
@@ -1101,6 +1270,13 @@ final class TrafficLightView: NSView {
         menu.addItem(withTitle: "缩小", action: #selector(AppDelegate.decreaseScale), keyEquivalent: "-")
         menu.addItem(withTitle: "重置大小", action: #selector(AppDelegate.resetScale), keyEquivalent: "0")
         menu.addItem(.separator())
+        if sidebarEdgePreference() != nil {
+            menu.addItem(withTitle: "展开完整灯", action: #selector(AppDelegate.exitSidebarMode), keyEquivalent: "")
+        } else {
+            menu.addItem(withTitle: "吸附到左侧", action: #selector(AppDelegate.snapToLeftSidebar), keyEquivalent: "")
+            menu.addItem(withTitle: "吸附到右侧", action: #selector(AppDelegate.snapToRightSidebar), keyEquivalent: "")
+        }
+        menu.addItem(.separator())
         addBlinkSettingsMenu(to: menu)
         menu.addItem(.separator())
         let quotaItem = NSMenuItem(title: "显示额度条", action: #selector(AppDelegate.toggleFiveHourQuota), keyEquivalent: "")
@@ -1133,6 +1309,14 @@ final class TrafficLightView: NSView {
     func lampAtEvent(_ event: NSEvent) -> String? {
         let point = convert(event.locationInWindow, from: nil)
         let designPoint = designPoint(from: point)
+        if sidebarEdgePreference() != nil {
+            for light in ["red", "yellow", "green"] {
+                if sidebarLampRect(for: light).insetBy(dx: -10, dy: -10).contains(designPoint) {
+                    return light
+                }
+            }
+            return nil
+        }
         let imageRect = photoImageRect()
         for light in ["red", "yellow", "green"] {
             let hitRect = photoLampRect(for: light, imageRect: imageRect).insetBy(dx: -12, dy: -12)
@@ -1294,7 +1478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let size = currentWindowSize()
         view = TrafficLightView(frame: NSRect(x: 0, y: 0, width: size.width, height: size.height))
-        let origin = clampedWindowOrigin(initialWindowOrigin())
+        let origin = sidebarEdgePreference() == nil ? clampedWindowOrigin(initialWindowOrigin()) : initialWindowOrigin()
         window = NSWindow(contentRect: NSRect(x: origin.x, y: origin.y, width: size.width, height: size.height), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = NSColor.clear
@@ -1304,6 +1488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = view
         view.ownerWindow = window
         view.onStateCommand = { [weak self] state in self?.setState(state) }
+        view.onSidebarEdgeChange = { [weak self] edge in self?.setSidebarEdge(edge) }
         view.updateTooltip()
         window.makeKeyAndOrderFront(nil)
         soundController.apply(state: view.state, playPrompt: false)
@@ -1313,6 +1498,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func initialWindowOrigin() -> NSPoint {
+        if let edge = sidebarEdgePreference(), let screen = NSScreen.main {
+            let preferredY = readDoublePreference(sidebarYPreferenceKey).map { CGFloat($0) }
+            return sidebarOrigin(edge: edge, preferredMidY: preferredY, size: windowSize(sidebar: true), screen: screen)
+        }
         if let x = readDoublePreference("window_x"), let y = readDoublePreference("window_y") {
             return NSPoint(x: x, y: y)
         }
@@ -1328,6 +1517,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func bringWindowBack() {
+        if let edge = sidebarEdgePreference() {
+            let anchorY = readDoublePreference(sidebarYPreferenceKey).map { CGFloat($0) } ?? window?.frame.midY
+            setSidebarEdge(edge, anchorMidY: anchorY, animate: false)
+            window.level = .floating
+            window.orderFrontRegardless()
+            return
+        }
         let origin = clampedWindowOrigin(initialWindowOrigin())
         window.setFrameOrigin(origin)
         window.level = .floating
@@ -1414,6 +1610,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func increaseScale() { applyScale(uiScale + 0.08) }
     @objc func decreaseScale() { applyScale(uiScale - 0.08) }
     @objc func resetScale() { applyScale(0.74) }
+    @objc func snapToLeftSidebar() { setSidebarEdge("left") }
+    @objc func snapToRightSidebar() { setSidebarEdge("right") }
+    @objc func exitSidebarMode() { setSidebarEdge(nil) }
     @objc func toggleRedBlink() { toggleBlink(for: "red") }
     @objc func toggleYellowBlink() { toggleBlink(for: "yellow") }
     @objc func toggleGreenBlink() { toggleBlink(for: "green") }
@@ -1461,6 +1660,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uiScale = clampedScale
         updatePreference("scale", value: Double(clampedScale))
 
+        if let edge = sidebarEdgePreference() {
+            setSidebarEdge(edge, anchorMidY: oldFrame.midY)
+            return
+        }
+
         let size = currentWindowSize()
         let centeredOrigin = NSPoint(x: oldFrame.midX - size.width / 2, y: oldFrame.midY - size.height / 2)
         let origin = clampedWindowOrigin(centeredOrigin)
@@ -1475,6 +1679,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func resizeForCurrentPreferences() {
         guard let window, let view else { return }
+        if let edge = sidebarEdgePreference() {
+            setSidebarEdge(edge, anchorMidY: window.frame.midY, animate: false)
+            return
+        }
         let oldFrame = window.frame
         let nextSize = currentWindowSize()
         let origin = clampedOriginForVisibleScreen(
@@ -1484,6 +1692,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let nextFrame = NSRect(origin: origin, size: nextSize)
         view.frame = NSRect(origin: .zero, size: nextSize)
         window.setFrame(nextFrame, display: true, animate: false)
+        updatePreference("window_x", value: Double(nextFrame.origin.x))
+        updatePreference("window_y", value: Double(nextFrame.origin.y))
+        view.updateTooltip()
+        view.needsDisplay = true
+        settingsWindowController?.refresh()
+    }
+
+    func setSidebarEdge(_ edge: String?, anchorMidY: CGFloat? = nil, animate: Bool = true) {
+        guard let window, let view else { return }
+        let oldFrame = window.frame
+        let screen = visibleScreen(for: oldFrame) ?? NSScreen.main
+
+        if let edge, let screen {
+            let nextSize = windowSize(sidebar: true)
+            let origin = sidebarOrigin(edge: edge, preferredMidY: anchorMidY ?? oldFrame.midY, size: nextSize, screen: screen)
+            let nextFrame = NSRect(origin: origin, size: nextSize)
+            updatePreference(sidebarPreferenceKey, value: edge)
+            updatePreference(sidebarYPreferenceKey, value: Double(nextFrame.midY))
+            view.frame = NSRect(origin: .zero, size: nextSize)
+            window.setFrame(nextFrame, display: true, animate: animate)
+            view.updateTooltip()
+            view.needsDisplay = true
+            settingsWindowController?.refresh()
+            return
+        }
+
+        updatePreference(sidebarPreferenceKey, value: "none")
+        let nextSize = windowSize(sidebar: false)
+        let centeredOrigin = NSPoint(x: oldFrame.midX - nextSize.width / 2, y: oldFrame.midY - nextSize.height / 2)
+        let origin = clampedOriginForVisibleScreen(centeredOrigin, size: nextSize)
+        let nextFrame = NSRect(origin: origin, size: nextSize)
+        view.frame = NSRect(origin: .zero, size: nextSize)
+        window.setFrame(nextFrame, display: true, animate: animate)
         updatePreference("window_x", value: Double(nextFrame.origin.x))
         updatePreference("window_y", value: Double(nextFrame.origin.y))
         view.updateTooltip()
@@ -2137,6 +2378,10 @@ func readDoublePreference(_ key: String) -> Double? {
         return Double(value)
     }
     return nil
+}
+
+func readStringPreference(_ key: String) -> String? {
+    readPreferences()[key] as? String
 }
 
 func readCGFloatPreference(_ key: String) -> CGFloat? {
