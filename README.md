@@ -12,7 +12,7 @@
 /bin/zsh -lc 'set -e; d="$HOME/.codex/codex-status-light"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else mkdir -p "$(dirname "$d")"; git clone https://github.com/liuqq666/coding-traffic-light.git "$d"; fi; cd "$d"; ./install.command'
 ```
 
-首次使用 hooks 时，Codex 会要求你信任一次。出现提示时，在 Codex 里运行 `/hooks`，按提示确认即可。
+首次使用或 hook 命令确实发生变化时，Codex 会要求你信任。出现提示时，在 Codex 里运行 `/hooks`，按提示确认即可。重复运行安装脚本会保留现有 hook 和信任状态，不会重复写入配置。
 
 ## 状态
 
@@ -49,6 +49,7 @@ install.command
 - 设置开机自动启动。
 - 安装 `codex-light` / `codex-light-run` / `codex-light-hook` 命令。
 - 把 Codex hooks 写入 `~/.codex/config.toml`。
+- 自动合并并去重旧版 CodexStatusLight hooks；已有的唯一 hook 会原位保留，避免更新后反复丢失信任。
 - Codex hook 收到事件时会自动拉起状态灯；如果状态灯没在运行，打开 Codex 后第一次会话活动会把它启动。
 
 也可以用命令行安装：
@@ -93,7 +94,7 @@ codex-light show
 - macOS 登录时通过 LaunchAgent 自动启动。
 - Codex hooks 被信任后，Codex 的第一次会话活动会自动拉起状态灯；如果状态灯已退出，后续 Codex 事件也会再次拉起。
 
-首次使用 hooks 时仍需要在 Codex 里运行一次 `/hooks` 并确认信任。这是 Codex 对本地 command hooks 的安全确认，项目脚本不会绕过。
+首次使用或 hook 命令确实变化时，仍需要在 Codex 里运行一次 `/hooks` 并确认信任。这是 Codex 对本地 command hooks 的安全确认，项目脚本不会绕过。普通升级会保留原 hook 的位置和信任状态。
 
 ## 命令行控制
 
@@ -134,8 +135,8 @@ codex-light-run python3 script.py
 
 ## 接入 Codex hooks
 
-安装脚本会自动把 `examples/codex-hooks.example.toml` 写入 `~/.codex/config.toml`。
-你只需要在 Codex 里运行一次 `/hooks`，按提示信任这些 hooks。
+安装脚本会自动把 `examples/codex-hooks.example.toml` 合并到 `~/.codex/config.toml`，并清理旧版本遗留的尾部重复项。已经正确安装时，脚本不会重写配置文件。
+首次安装或 hook 命令变化后，在 Codex 里运行一次 `/hooks`，按提示信任这些 hooks。
 
 规则：
 

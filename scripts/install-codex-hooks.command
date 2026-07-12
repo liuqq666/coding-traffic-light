@@ -1,30 +1,31 @@
 #!/bin/zsh
 set -e
 
-cd "$(dirname "$0")/.."
-
-CONFIG_DIR="$HOME/.codex"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="${CODEX_HOME:-$HOME/.codex}"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
-HOOKS_FILE="examples/codex-hooks.example.toml"
-TMP_FILE="$(mktemp)"
+HOOKS_FILE="$ROOT_DIR/examples/codex-hooks.example.toml"
+
+PYTHON="${CODEX_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  CODEX_BUNDLED_PYTHON="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+  if [ -x "$CODEX_BUNDLED_PYTHON" ]; then
+    PYTHON="$CODEX_BUNDLED_PYTHON"
+  else
+    PYTHON="$(command -v python3 || true)"
+  fi
+fi
+
+if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+  echo "Python 3 is required to install Codex hooks safely." >&2
+  exit 1
+fi
 
 mkdir -p "$CONFIG_DIR"
-touch "$CONFIG_FILE"
-
-awk '
-  /^# BEGIN CodexStatusLight hooks$/ { skip = 1; next }
-  /^# END CodexStatusLight hooks$/ { skip = 0; next }
-  skip != 1 { print }
-' "$CONFIG_FILE" > "$TMP_FILE"
-
-{
-  cat "$TMP_FILE"
-  printf "\n# BEGIN CodexStatusLight hooks\n"
-  cat "$HOOKS_FILE"
-  printf "# END CodexStatusLight hooks\n"
-} > "$CONFIG_FILE"
-
-rm -f "$TMP_FILE"
+"$PYTHON" "$SCRIPT_DIR/install_codex_hooks.py" \
+  --config "$CONFIG_FILE" \
+  --hooks "$HOOKS_FILE"
 
 echo "Codex hooks installed in $CONFIG_FILE"
-echo "Open Codex and run /hooks once to review and trust them."
+echo "Open Codex and run /hooks once to review and trust new or changed hooks."
