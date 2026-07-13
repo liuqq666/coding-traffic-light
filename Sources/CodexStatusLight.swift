@@ -13,6 +13,10 @@ let codexSessionsDir = codexHomeDir.appendingPathComponent("sessions")
 let codexArchivedSessionsDir = codexHomeDir.appendingPathComponent("archived_sessions")
 var instanceLockFD: Int32 = -1
 var codexThreadOpenabilityCache: [String: (openable: Bool, checkedAt: TimeInterval)] = [:]
+// Pointer movement and animation callbacks run at high frequency. Keep their
+// state/preferences lookups in memory; pollState invalidates state caches.
+var cachedStateObject: [String: Any]?
+var cachedPreferences: [String: Any]?
 
 let labels: [String: String] = [
     "working": "正在干活",
@@ -257,6 +261,10 @@ struct FiveHourQuota {
         "5小时额度剩余 \(percentText)，\(resetTimeText) 重刷"
     }
 }
+
+var cachedActiveSessions: [StatusSession]?
+var cachedFiveHourQuota: FiveHourQuota?
+var hasCachedFiveHourQuota = false
 
 func clipped(_ text: String, limit: Int) -> String {
     guard text.count > limit else { return text }
@@ -1106,15 +1114,14 @@ final class TrafficLightView: NSView {
 
     func updateResizeHandleHover(with event: NSEvent) {
         let hovering = pointIsInResizeHandle(event)
-        if hovering != isHoveringResizeHandle {
-            isHoveringResizeHandle = hovering
-            needsDisplay = true
-        }
+        guard hovering != isHoveringResizeHandle else { return }
+        isHoveringResizeHandle = hovering
         if hovering {
             NSCursor.resizeLeftRight.set()
         } else {
             NSCursor.arrow.set()
         }
+        needsDisplay = true
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -1450,11 +1457,14 @@ final class TrafficLightView: NSView {
     }
 
     func updateTooltip() {
+        let nextTooltip: String
         if fiveHourQuotaVisible(), let quota = latestFiveHourQuota() {
-            toolTip = "\(labels[state] ?? "空闲")\n\(quota.detailText)"
+            nextTooltip = "\(labels[state] ?? "空闲")\n\(quota.detailText)"
         } else {
-            toolTip = labels[state] ?? "空闲"
+            nextTooltip = labels[state] ?? "空闲"
         }
+        guard toolTip != nextTooltip else { return }
+        toolTip = nextTooltip
     }
 }
 
@@ -1546,6 +1556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if shouldForceRecompute {
             lastForcedRecompute = now
         }
+        invalidateStateCaches()
         if let command = readCommand() {
             applyCommand(command)
         }
@@ -1981,13 +1992,25 @@ func writeState(_ state: String) {
     if let data = try? JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted]) {
         try? data.write(to: stateFile)
     }
+    invalidateStateCaches()
+}
+
+func invalidateStateCaches() {
+    cachedStateObject = nil
+    cachedActiveSessions = nil
+    cachedFiveHourQuota = nil
+    hasCachedFiveHourQuota = false
 }
 
 func readStateObject() -> [String: Any] {
+    if let cachedStateObject {
+        return cachedStateObject
+    }
     guard let data = try? Data(contentsOf: stateFile),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         return [:]
     }
+    cachedStateObject = object
     return object
 }
 
@@ -2051,29 +2074,36 @@ func sessionByID(_ sessionID: String) -> StatusSession? {
 }
 
 func activeSessions(for targetState: String? = nil) -> [StatusSession] {
+    let sessions = activeSessionSnapshot()
+    guard let targetState else { return sessions }
+    return sessions.filter { $0.state == targetState }
+}
+
+func activeSessionSnapshot() -> [StatusSession] {
+    if let cachedActiveSessions {
+        return cachedActiveSessions
+    }
     let object = readStateObject()
     guard let sessions = object["sessions"] as? [String: Any] else {
+        cachedActiveSessions = []
         return []
     }
     var result: [StatusSession] = []
     for (id, value) in sessions {
-        guard let session = makeStatusSession(id: id, value: value) else {
-            continue
-        }
-        if let targetState, session.state != targetState {
-            continue
-        }
-        guard sessionIsFresh(session) else {
+        guard let session = makeStatusSession(id: id, value: value),
+              sessionIsFresh(session) else {
             continue
         }
         result.append(session)
     }
-    return result.sorted { lhs, rhs in
+    let sorted = result.sorted { lhs, rhs in
         if lhs.updatedAt == rhs.updatedAt {
             return lhs.id < rhs.id
         }
         return lhs.updatedAt > rhs.updatedAt
     }
+    cachedActiveSessions = sorted
+    return sorted
 }
 
 func attentionSessions(for targetState: String? = nil) -> [StatusSession] {
@@ -2256,31 +2286,39 @@ func stringValue(_ value: Any?) -> String? {
 }
 
 func latestFiveHourQuota() -> FiveHourQuota? {
+    if hasCachedFiveHourQuota {
+        return cachedFiveHourQuota
+    }
+
     let object = readStateObject()
-    if let quota = fiveHourQuota(from: object) {
-        return quota
-    }
-
-    var seen = Set<String>()
-    let sessions = attentionSessions() + activeSessions()
-    for session in sessions where !seen.contains(session.id) {
-        seen.insert(session.id)
-        if let quota = session.fiveHourQuota {
-            return quota
-        }
-    }
-
-    if let rawSessions = object["sessions"] as? [String: Any] {
-        let allSessions = rawSessions.compactMap { makeStatusSession(id: $0.key, value: $0.value) }
-            .sorted { $0.updatedAt > $1.updatedAt }
-        for session in allSessions where !seen.contains(session.id) {
+    var result = fiveHourQuota(from: object)
+    if result == nil {
+        var seen = Set<String>()
+        let sessions = attentionSessions() + activeSessions()
+        for session in sessions where !seen.contains(session.id) {
             seen.insert(session.id)
             if let quota = session.fiveHourQuota {
-                return quota
+                result = quota
+                break
+            }
+        }
+
+        if result == nil, let rawSessions = object["sessions"] as? [String: Any] {
+            let allSessions = rawSessions.compactMap { makeStatusSession(id: $0.key, value: $0.value) }
+                .sorted { $0.updatedAt > $1.updatedAt }
+            for session in allSessions where !seen.contains(session.id) {
+                seen.insert(session.id)
+                if let quota = session.fiveHourQuota {
+                    result = quota
+                    break
+                }
             }
         }
     }
-    return nil
+
+    cachedFiveHourQuota = result
+    hasCachedFiveHourQuota = true
+    return result
 }
 
 func fiveHourQuota(from object: [String: Any]) -> FiveHourQuota? {
@@ -2321,6 +2359,7 @@ func acknowledgeSession(_ sessionID: String) {
     if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) {
         try? data.write(to: stateFile)
     }
+    invalidateStateCaches()
 }
 
 func openCodexSession(_ sessionID: String) {
@@ -2342,18 +2381,25 @@ func clearCommand() {
     if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) {
         try? data.write(to: stateFile)
     }
+    invalidateStateCaches()
 }
 
 func readPreferences() -> [String: Any] {
+    if let cachedPreferences {
+        return cachedPreferences
+    }
     guard let data = try? Data(contentsOf: preferencesFile),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        cachedPreferences = [:]
         return [:]
     }
+    cachedPreferences = object
     return object
 }
 
 func writePreferences(_ prefs: [String: Any]) {
     ensureRuntime()
+    cachedPreferences = prefs
     if let data = try? JSONSerialization.data(withJSONObject: prefs, options: [.prettyPrinted, .sortedKeys]) {
         try? data.write(to: preferencesFile)
     }
